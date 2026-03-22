@@ -1,0 +1,244 @@
+---
+title: Network Provisioning
+description: Configure RADIUS authentication, PPPoE profiles, bandwidth shaping, and IP pool management.
+---
+
+## Overview
+
+FyberPay automates network provisioning so that subscriber activations, plan changes, suspensions, and cancellations are reflected on your network infrastructure in real-time. The system integrates with FreeRADIUS for authentication and MikroTik RouterOS for bandwidth enforcement and PPPoE service.
+
+## Architecture
+
+```
+Subscriber CPE -> MikroTik (PPPoE Server) -> FreeRADIUS -> PostgreSQL
+                                                              ^
+                                                              |
+                                                FyberPay API (writes credentials,
+                                                groups, and rate-limit attributes)
+```
+
+When FyberPay activates a subscription, it writes the subscriber's credentials and plan attributes directly to the RADIUS database. The MikroTik router queries FreeRADIUS during PPPoE authentication and receives the bandwidth limits and IP assignment for that subscriber.
+
+## RADIUS Setup
+
+FyberPay uses FreeRADIUS with a PostgreSQL backend. The RADIUS database is separate from the main FyberPay application database.
+
+### RADIUS Database Tables
+
+FyberPay manages these standard FreeRADIUS tables:
+
+| Table | Purpose |
+|---|---|
+| `radcheck` | Subscriber authentication credentials (Cleartext-Password, NT-Password) |
+| `radreply` | Per-subscriber reply attributes (Framed-IP-Address for static IPs) |
+| `radusergroup` | Maps subscribers to plan groups |
+| `radgroupreply` | Plan-level attributes (Mikrotik-Rate-Limit for bandwidth) |
+| `radacct` | Accounting records (session start/stop, bytes transferred) |
+
+### How Provisioning Events Flow
+
+FyberPay uses a transactional outbox pattern for all provisioning events. When a subscription state changes, the event is written to the outbox in the same database transaction. A background processor then dispatches the event to the RADIUS provisioning listener.
+
+<Tabs>
+  <Tab title="Activation">
+    When `subscription.activated` fires:
+    1. **radcheck**: Upserts `Cleartext-Password` and `NT-Password` for the PPPoE username
+    2. **radusergroup**: Maps the username to the plan's RADIUS group
+    3. **radreply**: If access method is `static`, sets `Framed-IP-Address`
+
+    The subscriber can now authenticate via PPPoE.
+  </Tab>
+  <Tab title="Plan Change">
+    When `subscription.upgraded` fires:
+    1. **radusergroup**: Updates the username's group to the new plan's RADIUS group
+
+    The new bandwidth limit takes effect on the subscriber's next re-authentication or CoA (Change of Authorization).
+  </Tab>
+  <Tab title="Suspension / Walled Garden">
+    When `subscription.suspended` or `dunning.walled_garden` fires:
+    1. **radusergroup**: Moves the username to the `walled-garden` group
+
+    The subscriber's connection is restricted to the payment portal only.
+  </Tab>
+  <Tab title="Cancellation">
+    When `subscription.cancelled` fires:
+    1. **radcheck**: Deletes all credentials for the username
+    2. **radusergroup**: Removes the group mapping
+    3. **radreply**: Deletes all reply attributes
+
+    The subscriber can no longer authenticate.
+  </Tab>
+  <Tab title="Expiry">
+    When `subscription.expired` fires:
+    1. **radusergroup**: Moves the username to the `walled-garden` group
+
+    Same behavior as walled garden. The subscriber retains a connection but can only reach the payment portal.
+  </Tab>
+</Tabs>
+
+## PPPoE Profiles
+
+### Creating Plans with RADIUS Groups
+
+When you create a plan in FyberPay at **Billing > Plans**, a RADIUS group is automatically generated. The group name follows the pattern:
+
+```
+plan-{plan-name-lowercased}
+```
+
+For example, a plan named "Home Basic" gets the RADIUS group `plan-home-basic`. You can override this with a custom group name in the plan creation form.
+
+### Rate-Limit Attributes
+
+FyberPay writes the `Mikrotik-Rate-Limit` attribute to the `radgroupreply` table for each plan. The format follows MikroTik's rate-limit syntax:
+
+```
+{upload}k/{download}k
+```
+
+For a plan with 5 Mbps upload and 20 Mbps download:
+
+```
+Mikrotik-Rate-Limit := "5120k/20480k"
+```
+
+### Burst Configuration
+
+Plans can optionally include burst settings for MikroTik simple queues:
+
+| Setting | Description | Example |
+|---|---|---|
+| **Burst Limit** | Maximum speed during burst | `10240k/40960k` |
+| **Burst Threshold** | Speed at which burst deactivates | `4096k/16384k` |
+| **Burst Time** | Duration of burst window | `10/10` |
+
+When burst is configured, the full rate-limit string becomes:
+
+```
+{upload}k/{download}k {burstUpload}k/{burstDownload}k {thresholdUp}k/{thresholdDown}k {burstTime}
+```
+
+<Info>
+  Burst settings are optional. If not configured, FyberPay writes a simple rate-limit string without burst parameters. MikroTik treats this as a hard bandwidth cap.
+</Info>
+
+## Bandwidth Shaping
+
+### MikroTik Simple Queues
+
+FyberPay enforces bandwidth through MikroTik simple queues, driven by the `Mikrotik-Rate-Limit` RADIUS attribute. When a subscriber authenticates via PPPoE, MikroTik automatically creates a dynamic simple queue based on the RADIUS reply.
+
+You can view all active queues from **Network > [Router] > Queues** in the FyberPay dashboard. Each queue shows:
+
+- Queue name (typically the PPPoE username)
+- Target (subscriber's assigned IP)
+- Max limit (upload/download cap)
+- Burst limit (if configured)
+
+### Manual Queue Adjustments
+
+For temporary bandwidth adjustments (for example, a promotional speed boost), you can update a queue directly from the FyberPay dashboard:
+
+1. Navigate to **Network > [Router] > Queues**
+2. Find the subscriber's queue
+3. Click **Edit** and adjust the `maxLimit` or `burstLimit`
+
+<Warning>
+  Manual queue adjustments are overwritten when the subscriber re-authenticates (reconnects PPPoE). For permanent changes, update the subscriber's plan instead.
+</Warning>
+
+## IP Pool Management
+
+### Dynamic IP Assignment
+
+By default, MikroTik assigns dynamic IPs from the PPPoE IP pool. Configure your IP pool on the MikroTik router under **IP > Pool**. FyberPay does not manage dynamic IP pools directly; this is handled by the router's PPP profile.
+
+### Static IP Assignment
+
+For subscribers who need a fixed IP:
+
+1. Set the subscriber's access method to **Static IP** in FyberPay
+2. Enter the desired IP address
+3. FyberPay writes `Framed-IP-Address` to the RADIUS `radreply` table
+4. On the next PPPoE connection, MikroTik assigns this specific IP instead of one from the pool
+
+<Tip>
+  Reserve a separate IP range for static assignments and exclude it from your dynamic IP pool. For example, use `10.0.0.1-10.0.0.200` for dynamic and `10.0.0.201-10.0.0.254` for static subscribers.
+</Tip>
+
+## VLAN Assignment
+
+For ISPs using VLANs to segment subscriber traffic:
+
+1. Create VLAN interfaces on your MikroTik router
+2. Configure separate PPPoE servers on each VLAN interface
+3. Assign subscribers to the appropriate PPPoE server based on their location or service tier
+
+FyberPay tracks which NAS device (router) serves each subscriber. When you add a NAS device at **Settings > Network > Routers**, you can specify the VLAN interface it serves.
+
+## Router Management
+
+### Adding NAS Devices
+
+Navigate to **Settings > Network > Routers** and click **Add Router**:
+
+<Steps>
+  <Step title="Enter router details">
+    - **Name**: A descriptive label (e.g., "Ruiru Tower MikroTik")
+    - **Tunnel IP**: The router's IP address accessible via your management tunnel (SSTP/L2TP)
+    - **RouterOS Username**: API username for the router
+    - **RouterOS Password**: API password (encrypted at rest)
+    - **API Port**: Default is 80 for HTTP, 443 for HTTPS
+  </Step>
+  <Step title="Test connectivity">
+    Click **Ping** to verify FyberPay can reach the router via the RouterOS REST API.
+  </Step>
+  <Step title="Configure PPPoE server">
+    FyberPay can auto-detect available interfaces and set up a PPPoE server. Click **Setup PPPoE** and select the interface (bridge or ethernet) for subscriber connections.
+  </Step>
+</Steps>
+
+### Fleet Monitoring
+
+View all your routers at **Network > Fleet Status**. For each device, FyberPay shows:
+
+- Connection status (reachable/unreachable)
+- RouterOS version
+- CPU load and memory usage
+- Uptime
+- Active PPP sessions count
+
+<Info>
+  Fleet status polls routers in batches of 10 concurrent requests to avoid overwhelming your management tunnel. Devices without configured RouterOS credentials are shown as "unconfigured."
+</Info>
+
+## Walled Garden
+
+The walled garden is a restricted network state where subscribers can only access the FyberPay payment portal. It is used for:
+
+- Expired subscriptions
+- Subscribers in the dunning pipeline
+- Manually suspended subscribers
+
+When FyberPay moves a subscriber to the walled garden, it changes their RADIUS group to `walled-garden`. Configure the walled garden on your MikroTik router to allow traffic only to your FyberPay domain and M-Pesa payment endpoints.
+
+### MikroTik Walled Garden Configuration
+
+On your MikroTik router, create firewall rules that allow walled-garden subscribers to reach:
+
+- Your FyberPay subdomain (e.g., `yourorg.fyberpay.com`)
+- Safaricom M-Pesa API endpoints (for STK Push payments)
+- DNS servers (so domain resolution works)
+
+Block all other traffic for addresses in the walled-garden IP pool.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Hotspot Setup" icon="wifi" href="/guides/hotspot-setup">
+    Configure captive portal hotspots with voucher-based access.
+  </Card>
+  <Card title="Subscriber Management" icon="users" href="/guides/subscriber-management">
+    Add subscribers, manage plan changes, and track lifecycle states.
+  </Card>
+</CardGroup>

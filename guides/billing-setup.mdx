@@ -1,0 +1,179 @@
+---
+title: Billing Setup
+description: Configure invoicing, payment terms, tax settings, and billing cycles for your ISP.
+---
+
+## Overview
+
+FyberPay handles the entire billing lifecycle for your ISP: invoice generation, tax calculation, payment tracking, and receipt delivery. This guide walks you through configuring billing to match your business requirements.
+
+## Billing Settings
+
+Navigate to **Settings > Billing** to configure your organization's billing defaults.
+
+### Invoice Configuration
+
+<Steps>
+  <Step title="Set your invoice prefix">
+    Choose a prefix for your invoice numbers (e.g., `ACM` produces invoice numbers like `ACM-0001`, `ACM-0002`). This prefix is applied to all auto-generated and manual invoices.
+  </Step>
+  <Step title="Configure your currency">
+    FyberPay defaults to **KES** (Kenyan Shilling). The currency code appears on all invoices, receipts, and the subscriber portal.
+  </Step>
+  <Step title="Set the grace period">
+    The grace period defines how many days after the due date an invoice is considered overdue. The default is **3 days**. After this period, the dunning pipeline begins.
+  </Step>
+  <Step title="Add payment details">
+    Enter your **M-Pesa Paybill number**, bank name, and account details. These appear on invoice PDFs so subscribers know where to send payments.
+  </Step>
+  <Step title="Customize the invoice footer">
+    Add a custom footer message to all invoices, such as your terms of service or a thank-you note.
+  </Step>
+</Steps>
+
+### Tax Settings
+
+<Info>
+  FyberPay calculates tax as a percentage of the subtotal. For VAT-registered ISPs in Kenya, set the tax rate to **0.16** (16% VAT). Non-VAT-registered ISPs should leave it at **0** (the default).
+</Info>
+
+Navigate to **Settings > Billing** and set the **Tax Rate** field. The rate is expressed as a decimal:
+
+| Scenario | Tax Rate Value |
+|---|---|
+| No VAT (default) | `0` |
+| Kenya VAT (16%) | `0.16` |
+| Custom rate | `0.xx` |
+
+Tax is calculated automatically on every invoice. Given a plan priced at KES 2,500 with a 16% tax rate:
+- Subtotal: KES 2,500
+- Tax (16%): KES 400
+- Total: KES 2,900
+
+### Receipt Templates
+
+Invoice PDFs are generated automatically and include:
+- Your organization name, logo, and contact details (from **Settings > Organization**)
+- Subscriber name and phone number
+- Plan name, billing period, and line-item breakdown
+- Tax breakdown (subtotal, tax amount, total)
+- Payment instructions (M-Pesa Paybill, bank details)
+- Custom footer text
+
+<Tip>
+  Upload your company logo at **Settings > Organization > Logo** to brand your invoices. The logo appears in the top-left corner of all generated PDFs.
+</Tip>
+
+## Billing Cycles
+
+Each subscription plan defines its own billing cycle in days. When you create a plan at **Billing > Plans**, you set the `billingCycleDays` field.
+
+### Common Billing Cycles
+
+| Cycle | Days | Typical Use |
+|---|---|---|
+| Monthly | 30 | Standard residential plans |
+| Quarterly | 90 | Discounted long-term plans |
+| Semi-annual | 180 | Business or enterprise plans |
+| Annual | 365 | Large-volume corporate deals |
+
+<Info>
+  Billing cycle days are counted from the subscription activation date. A 30-day cycle activated on March 1st expires on March 31st.
+</Info>
+
+### How Billing Cycles Work
+
+1. A subscriber activates a plan with a 30-day cycle
+2. FyberPay sets the expiry date to 30 days from activation
+3. **Three days before expiry**, FyberPay auto-generates a renewal invoice
+4. The invoice is sent to the subscriber via SMS and email
+5. On payment, the subscription extends by another 30 days
+6. If unpaid, the dunning pipeline kicks in after the grace period
+
+## Auto-Generated Invoices
+
+FyberPay runs a bulk invoice generation job that creates invoices for all subscriptions expiring within the next 3 days. This process:
+
+- Skips subscriptions that already have a pending (draft or sent) invoice
+- Calculates tax based on your org's configured tax rate
+- Fires an `invoice.created` event that triggers SMS/email notifications and Bill Manager sync
+
+### Invoice Status Lifecycle
+
+Invoices move through these statuses:
+
+```
+draft -> sent -> paid
+                  \-> overdue -> paid
+                              \-> void
+```
+
+| Status | Meaning |
+|---|---|
+| **Draft** | Invoice created but not yet delivered to subscriber |
+| **Sent** | Invoice delivered via SMS, email, or Bill Manager |
+| **Overdue** | Past the due date and grace period, unpaid |
+| **Paid** | Payment received and matched |
+| **Void** | Cancelled with a reason (does not count toward revenue) |
+
+### Manual Invoice Actions
+
+From the **Billing > Invoices** page, you can:
+
+- **Send** a draft invoice (transitions to "sent" status)
+- **Void** an invoice with a reason (available for draft, sent, or overdue invoices)
+- **Create a credit note** for a paid invoice (partial or full refund, creates a negative-amount invoice)
+
+## Prorated Charges
+
+When a subscriber upgrades or downgrades their plan mid-cycle, FyberPay calculates prorated charges automatically.
+
+<AccordionGroup>
+  <Accordion title="How proration works">
+    FyberPay calculates the daily rate of both the old and new plans, then computes the difference for the remaining days in the current billing cycle.
+
+    **Example**: A subscriber on the KES 2,000/month plan (30 days) upgrades to the KES 3,000/month plan with 15 days remaining.
+
+    - Old daily rate: KES 2,000 / 30 = KES 66.67
+    - New daily rate: KES 3,000 / 30 = KES 100.00
+    - Difference per day: KES 33.33
+    - Proration amount: KES 33.33 x 15 = **KES 500**
+
+    The subscriber is charged KES 500 for the upgrade.
+  </Accordion>
+  <Accordion title="Downgrades">
+    When a subscriber downgrades, the proration calculation produces a credit. This credit is applied to their next invoice automatically.
+  </Accordion>
+  <Accordion title="Mid-cycle plan changes and RADIUS">
+    Plan changes take effect immediately. FyberPay updates the subscriber's RADIUS group in real-time, so bandwidth limits change within seconds of the plan change being confirmed.
+  </Accordion>
+</AccordionGroup>
+
+## Billing Notifications
+
+FyberPay sends automated billing notifications at several points:
+
+| Trigger | Channel | Content |
+|---|---|---|
+| Invoice created | SMS + Email | Invoice details with payment instructions |
+| Payment received | SMS + Email | Payment confirmation receipt |
+| Expiry reminder (3 days before) | SMS + Email | Renewal reminder with pay link |
+| Expiry reminder (1 day before) | SMS + Email | Urgent renewal reminder |
+| Expiry day | SMS + Email | Final reminder before service restriction |
+
+<Tip>
+  Configure reminder timing at **Settings > Notifications**. The default sends reminders at 3 days, 1 day, and 0 days before expiry. You can adjust these intervals to match your subscriber base.
+</Tip>
+
+Notification channels can be toggled independently. Navigate to **Settings > Notifications** to enable or disable SMS and email notifications.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="M-Pesa Integration" icon="mobile-screen" href="/guides/mpesa-integration">
+    Set up STK Push, Bill Manager, and payment reconciliation.
+  </Card>
+  <Card title="Dunning Automation" icon="bell" href="/guides/dunning-automation">
+    Configure automated payment retries, walled garden, and suspension rules.
+  </Card>
+</CardGroup>

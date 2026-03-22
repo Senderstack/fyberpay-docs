@@ -1,0 +1,98 @@
+---
+title: Quickstart
+description: Set up your ISP on FyberPay in under 15 minutes.
+---
+
+## 1. Create Your Account
+
+<Steps>
+  <Step title="Register">
+    Go to [fyberpay.com/register](https://fyberpay.com/register) and create your ISP operator account. You'll choose your organization slug (e.g., `acme`) which becomes your subdomain.
+  </Step>
+  <Step title="Verify Email">
+    Check your inbox for a verification OTP. Enter it to activate your account.
+  </Step>
+  <Step title="Access Dashboard">
+    Navigate to `acme.fyberpay.com` (your chosen slug) and log in. You'll land on the admin dashboard.
+  </Step>
+</Steps>
+
+## 2. Configure Your Organization
+
+From **Settings > Organization**, fill in:
+
+- **Organization name** and contact details
+- **Currency** (KES is default)
+- **Invoice prefix** (e.g., `ACM-` for invoice numbers like ACM-0001)
+- **Grace period** for overdue invoices (default: 3 days)
+
+## 3. Create Subscription Plans
+
+Go to **Billing > Plans** and create your service tiers:
+
+```
+Example plans:
+- Basic Home:   10 Mbps / KES 1,500/month
+- Standard:     20 Mbps / KES 2,500/month
+- Premium:      50 Mbps / KES 4,500/month
+- Business:    100 Mbps / KES 8,000/month
+```
+
+Each plan defines:
+- Bandwidth limits (upload/download)
+- Monthly price
+- Billing cycle (monthly, quarterly, annually)
+- RADIUS attributes (auto-applied on activation)
+
+## 4. Set Up M-Pesa
+
+Go to **Settings > Payment Gateways > M-Pesa** and enter your Daraja API credentials:
+
+<Info>
+  You need a Safaricom Daraja developer account. Register at [developer.safaricom.co.ke](https://developer.safaricom.co.ke) and create an app with M-Pesa Express (STK Push) and C2B APIs enabled.
+</Info>
+
+- **Consumer Key** and **Consumer Secret** from your Daraja app
+- **Shortcode** (Paybill or Till number)
+- **Passkey** for STK Push
+- **Callback URL** is auto-configured by FyberPay
+
+Test the integration using the **Send Test STK Push** button.
+
+## 5. Connect Your Router
+
+Go to **Settings > Network > Routers** and add your MikroTik device:
+
+- **Host**: Router IP address (public or VPN-accessible)
+- **Port**: API port (default 8728, or 8729 for TLS)
+- **Username/Password**: RouterOS API credentials
+
+FyberPay will sync RADIUS profiles, PPP secrets, and hotspot users automatically.
+
+## 6. Add Your First Subscriber
+
+Go to **Subscribers > Add Subscriber**:
+
+1. Enter subscriber details (name, phone, email)
+2. Assign a subscription plan
+3. Choose connection type (PPPoE or Hotspot)
+4. FyberPay auto-provisions RADIUS credentials and router config
+
+The subscriber receives an SMS with their connection details and can access the self-service portal at `yourorg.fyberpay.com/portal`.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Billing Setup" icon="file-invoice-dollar" href="/guides/billing-setup">
+    Configure invoicing, payment reminders, and dunning automation.
+  </Card>
+  <Card title="M-Pesa Deep Dive" icon="mobile-screen" href="/guides/mpesa-integration">
+    STK Push, C2B, Bill Manager, and reconciliation workflows.
+  </Card>
+  <Card title="Network Provisioning" icon="network-wired" href="/guides/network-provisioning">
+    RADIUS, PPPoE profiles, bandwidth shaping, and CPE management.
+  </Card>
+  <Card title="Subscriber Management" icon="users" href="/guides/subscriber-management">
+    Bulk imports, plan changes, suspensions, and the subscriber lifecycle.
+  </Card>
+</CardGroup>

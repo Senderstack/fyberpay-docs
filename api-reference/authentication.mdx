@@ -1,0 +1,365 @@
+---
+title: Authentication
+description: Login flows, OTP verification, token refresh, logout, JWT structure, roles, and lockout policy for the FyberPay API.
+---
+
+## Overview
+
+FyberPay authentication is session-based, using JWT access tokens and opaque refresh tokens
+delivered as `httpOnly` cookies. All auth endpoints live under the `/auth` path.
+
+Two login methods are supported:
+
+<CardGroup cols={2}>
+  <Card title="Password Login" icon="lock">
+    Email and password authentication. Used by ISP admins and support staff.
+  </Card>
+  <Card title="OTP Login" icon="mobile-screen">
+    One-time password sent via email or SMS. Used primarily by subscribers accessing the portal.
+  </Card>
+</CardGroup>
+
+## Password Login
+
+Authenticate with an email address and password. On success, the server sets `access_token` and
+`refresh_token` cookies and returns the user profile.
+
+<CodeGroup>
+```bash Request
+curl -X POST https://acme.api.fyberpay.com/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "admin@acme-isp.co.ke",
+    "password": "your-password"
+  }'
+```
+
+```json Response (200 OK)
+{
+  "user": {
+    "id": "usr_01H5K3...",
+    "email": "admin@acme-isp.co.ke",
+    "phone": "+254700000000",
+    "firstName": "Jane",
+    "lastName": "Mwangi",
+    "role": "admin"
+  },
+  "org": {
+    "id": "org_01H5K3...",
+    "slug": "acme",
+    "name": "Acme ISP"
+  },
+  "mustChangePassword": false,
+  "accessToken": "eyJhbGciOiJIUzI1NiIs...",
+  "refreshToken": "rt_a1b2c3d4e5..."
+}
+```
+</CodeGroup>
+
+### Request body
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `email` | `string` | Yes | The user's email address |
+| `password` | `string` | Yes | The user's password |
+
+### Subdomain vs. root domain
+
+| Context | Behavior |
+|---------|----------|
+| **Subdomain** (`acme.api.fyberpay.com`) | Validates that the user is a member of the organization. Returns the user's org-level role. |
+| **Root domain** (`api.fyberpay.com`) | Restricted to `super_admin` users only. Non-super-admin users receive a `403 Forbidden` response. |
+
+### Forced password change
+
+When `mustChangePassword` is `true`, the client should redirect to the password change screen
+before granting access to the dashboard. This flag is set when an admin creates an account with
+a temporary password.
+
+## OTP Login
+
+The OTP flow uses two steps: request a code, then verify it.
+
+### Step 1: Request OTP
+
+Send a one-time password to the user's email or phone number. The code is valid for 5 minutes.
+
+<CodeGroup>
+```bash Request
+curl -X POST https://acme.api.fyberpay.com/auth/otp/send \
+  -H "Content-Type: application/json" \
+  -d '{
+    "identifier": "+254712345678"
+  }'
+```
+
+```json Response (200 OK)
+{
+  "message": "OTP sent"
+}
+```
+</CodeGroup>
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `identifier` | `string` | Yes | Email address or phone number (E.164 format) |
+
+The server auto-detects whether the identifier is an email or phone number and sends the OTP
+through the appropriate channel (SMTP for email, AfricasTalking for SMS).
+
+<Info>
+  For security, the response is always `"OTP sent"` regardless of whether the account exists.
+  This prevents user enumeration.
+</Info>
+
+### Step 2: Verify OTP
+
+Submit the received code to complete authentication.
+
+<CodeGroup>
+```bash Request
+curl -X POST https://acme.api.fyberpay.com/auth/otp/verify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "identifier": "+254712345678",
+    "code": "482910"
+  }'
+```
+
+```json Response (200 OK)
+{
+  "user": {
+    "id": "usr_01H5K3...",
+    "email": null,
+    "phone": "+254712345678",
+    "firstName": "Subscriber",
+    "lastName": "",
+    "role": "subscriber"
+  },
+  "org": {
+    "id": "org_01H5K3...",
+    "slug": "acme",
+    "name": "Acme ISP"
+  },
+  "mustChangePassword": false,
+  "accessToken": "eyJhbGciOiJIUzI1NiIs...",
+  "refreshToken": "rt_a1b2c3d4e5..."
+}
+```
+</CodeGroup>
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `identifier` | `string` | Yes | Same email or phone used in the request step |
+| `code` | `string` | Yes | The 6-digit OTP code |
+
+### OTP verification limits
+
+Each OTP code allows a maximum of **3 verification attempts**. After 3 failed attempts, the code
+is invalidated and the user must request a new one.
+
+### Organization selection (root domain)
+
+When a non-super-admin user verifies their OTP on the root domain, the response includes a list
+of their organizations instead of issuing tokens directly:
+
+```json
+{
+  "requiresOrgSelection": true,
+  "verifiedToken": "vt_xyz789...",
+  "user": {
+    "id": "usr_01H5K3...",
+    "firstName": "Jane",
+    "lastName": "Mwangi"
+  },
+  "organizations": [
+    { "id": "org_01H5K3...", "name": "Acme ISP", "slug": "acme", "role": "admin" },
+    { "id": "org_02X7Y8...", "name": "Beta Net", "slug": "beta", "role": "support" }
+  ]
+}
+```
+
+The client then redirects the user to the chosen organization's subdomain and completes login
+using `POST /auth/otp/complete` with the `verifiedToken` and selected `orgId`.
+
+## Token Refresh
+
+Access tokens expire after 15 minutes. Use the refresh endpoint to obtain a new pair of tokens
+without re-authenticating.
+
+<CodeGroup>
+```bash Request
+curl -X POST https://acme.api.fyberpay.com/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d '{
+    "refreshToken": "rt_a1b2c3d4e5..."
+  }'
+```
+
+```json Response (200 OK)
+{
+  "message": "Token refreshed",
+  "accessToken": "eyJhbGciOiJIUzI1NiIs...",
+  "refreshToken": "rt_f6g7h8i9j0..."
+}
+```
+</CodeGroup>
+
+The refresh token can be passed either in the request body or via the `refresh_token` cookie.
+When using cookies (the default for web clients), no request body is needed.
+
+<Warning>
+  Refresh tokens are single-use. Each refresh call issues a new refresh token and invalidates the
+  previous one. If a refresh token is reused, both the old and new tokens are revoked as a
+  security precaution.
+</Warning>
+
+## Logout
+
+Revoke the current session and clear auth cookies.
+
+<CodeGroup>
+```bash Request
+curl -X POST https://acme.api.fyberpay.com/auth/logout
+```
+
+```json Response (200 OK)
+{
+  "message": "Logged out"
+}
+```
+</CodeGroup>
+
+The server revokes the refresh token in Redis and clears both `access_token` and `refresh_token`
+cookies from the response.
+
+## JWT Structure
+
+FyberPay issues two tokens on successful authentication:
+
+### Access token
+
+A signed JWT with a **15-minute** lifetime. Contains the claims needed for request authorization.
+
+| Claim | Description |
+|-------|-------------|
+| `sub` | User ID |
+| `role` | User's role within the current context (`admin`, `support`, `subscriber`, or `super_admin`) |
+| `orgId` | Organization ID (null for platform-level super_admin sessions) |
+| `iat` | Issued-at timestamp |
+| `exp` | Expiration timestamp (15 minutes after issuance) |
+
+### Refresh token
+
+An opaque token (not a JWT) with a **7-day** lifetime. Stored in Redis with a reference to the
+user and organization. Used solely to obtain new access tokens via `POST /auth/refresh`.
+
+### Cookie configuration
+
+| Property | Value |
+|----------|-------|
+| `httpOnly` | `true` |
+| `secure` | `true` (production) |
+| `sameSite` | `lax` |
+| `domain` | `.fyberpay.com` (allows cross-subdomain access) |
+| `path` | `/` |
+
+## Roles and Permissions
+
+FyberPay uses role-based access control. Each user has a role scoped to their organization
+membership.
+
+<AccordionGroup>
+  <Accordion title="super_admin" icon="crown">
+    Platform-level administrators. Can access all organizations, manage platform settings, and
+    perform billing operations. Can only log in via the root domain (`api.fyberpay.com`).
+  </Accordion>
+  <Accordion title="admin" icon="user-gear">
+    ISP organization administrators. Full access to their organization's dashboard: subscriber
+    management, billing configuration, payment gateways, network provisioning, and staff
+    management.
+  </Accordion>
+  <Accordion title="support" icon="headset">
+    ISP support staff with read-only access. Can view subscribers, invoices, and payments but
+    cannot modify configurations, manage staff, or change billing settings.
+  </Accordion>
+  <Accordion title="subscriber" icon="user">
+    End-user subscribers accessing the self-service portal. Can view their own invoices, make
+    payments, check usage, update profile details, and submit support requests.
+  </Accordion>
+</AccordionGroup>
+
+### Role hierarchy
+
+Endpoints enforce minimum role requirements using guards. A request from a lower-privilege role
+to a higher-privilege endpoint returns `403 Forbidden`.
+
+```
+super_admin > admin > support > subscriber
+```
+
+## Account Lockout Policy
+
+FyberPay protects against brute-force attacks with an automatic lockout mechanism.
+
+<Steps>
+  <Step title="Failed login attempt">
+    Each failed password login increments a per-email counter in Redis.
+  </Step>
+  <Step title="Threshold reached">
+    After **5 consecutive failed attempts**, the account is locked for **15 minutes**.
+  </Step>
+  <Step title="Lockout active">
+    All login attempts for that email are rejected with `401 Unauthorized` and a message
+    indicating the account is temporarily locked.
+  </Step>
+  <Step title="Automatic unlock">
+    The lockout expires automatically after 15 minutes. The counter resets on successful login.
+  </Step>
+</Steps>
+
+### Lockout details
+
+| Parameter | Value |
+|-----------|-------|
+| Max failed attempts | 5 |
+| Lockout duration | 15 minutes |
+| Counter scope | Per email address |
+| Counter reset | On successful login |
+| Storage | Redis with TTL-based expiration |
+
+<Note>
+  OTP verification has a separate limit: **3 failed attempts per code**. After 3 incorrect
+  entries, the code is invalidated and the user must request a new OTP.
+</Note>
+
+## Getting the Current User
+
+After authenticating, you can fetch the current user's profile and organization context.
+
+<CodeGroup>
+```bash Request
+curl https://acme.api.fyberpay.com/auth/me \
+  -H "Cookie: access_token=eyJhbGciOiJIUzI1NiIs..."
+```
+
+```json Response (200 OK)
+{
+  "id": "usr_01H5K3...",
+  "email": "admin@acme-isp.co.ke",
+  "phone": "+254700000000",
+  "firstName": "Jane",
+  "lastName": "Mwangi",
+  "role": "admin",
+  "status": "active",
+  "org": {
+    "id": "org_01H5K3...",
+    "slug": "acme",
+    "name": "Acme ISP"
+  }
+}
+```
+</CodeGroup>
+
+This endpoint requires a valid access token. It is commonly used by frontend clients on page load
+to hydrate the user session.

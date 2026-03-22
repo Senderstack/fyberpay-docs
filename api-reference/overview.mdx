@@ -1,0 +1,252 @@
+---
+title: API Overview
+description: Base URL patterns, authentication, rate limiting, error handling, pagination, idempotency, and webhook delivery for the FyberPay API.
+---
+
+## Public API Status
+
+<Note>
+  The FyberPay public REST API is **coming soon**. Today, all platform functionality is accessed
+  through the web dashboard and subscriber portal. This reference documents the internal API
+  surface that the public API will mirror once released.
+</Note>
+
+When the public API launches, you will be able to manage subscribers, invoices, payments, plans,
+and network provisioning programmatically. Subscribe to the [FyberPay blog](https://fyberpay.com/blog)
+for launch updates.
+
+## Base URL
+
+FyberPay uses subdomain-based multi-tenancy. Every API request is scoped to an organization by its
+subdomain:
+
+```
+https://{orgSlug}.api.fyberpay.com
+```
+
+| Environment | Pattern |
+|-------------|---------|
+| Production  | `https://{orgSlug}.api.fyberpay.com` |
+| Platform admin | `https://api.fyberpay.com` (super_admin only) |
+
+Replace `{orgSlug}` with your organization's slug. For example, if your ISP's slug is `acme`:
+
+```
+https://acme.api.fyberpay.com/subscribers
+```
+
+## Authentication
+
+FyberPay supports two authentication methods:
+
+<CardGroup cols={2}>
+  <Card title="Session Cookies" icon="cookie">
+    JWT access and refresh tokens delivered as `httpOnly` cookies. Used by the web dashboard and
+    subscriber portal automatically.
+  </Card>
+  <Card title="API Keys" icon="key">
+    Bearer token authentication for server-to-server integrations. Pass the key in the
+    `Authorization` header. Available when the public API launches.
+  </Card>
+</CardGroup>
+
+### Cookie-based auth (web clients)
+
+After a successful login, the server sets two `httpOnly` cookies:
+
+| Cookie | Purpose | Lifetime |
+|--------|---------|----------|
+| `access_token` | JWT for request authentication | 15 minutes |
+| `refresh_token` | Opaque token for obtaining new access tokens | 7 days |
+
+Cookies are scoped to `.fyberpay.com` so they work across subdomains.
+
+### API key auth (server-to-server)
+
+<Info>
+  API keys will be available when the public API launches. The format is documented here for
+  early reference.
+</Info>
+
+```bash
+curl https://acme.api.fyberpay.com/subscribers \
+  -H "Authorization: Bearer fybr_live_abc123..."
+```
+
+See [Authentication](/api-reference/authentication) for full details on login flows and token
+management.
+
+## Rate Limiting
+
+All endpoints are rate-limited to protect platform stability.
+
+| Scope | Limit |
+|-------|-------|
+| Authenticated requests | 300 requests per minute per user |
+| Login / OTP endpoints | 10 requests per minute per IP |
+| Webhook callbacks | 100 requests per minute per gateway |
+
+When you exceed a limit, the API returns `429 Too Many Requests` with a `Retry-After` header
+indicating how many seconds to wait.
+
+## Error Response Format
+
+All errors follow a consistent JSON structure:
+
+```json
+{
+  "statusCode": 422,
+  "message": "Validation failed: email must be a valid email address",
+  "error": "Unprocessable Entity"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `statusCode` | `number` | HTTP status code |
+| `message` | `string` or `string[]` | Human-readable error description. Validation errors may return an array of messages. |
+| `error` | `string` | HTTP status text |
+
+### Common status codes
+
+| Code | Meaning |
+|------|---------|
+| `400` | Bad Request. Malformed input or missing required fields. |
+| `401` | Unauthorized. Missing or expired authentication. |
+| `403` | Forbidden. Authenticated but lacking permission for this action. |
+| `404` | Not Found. Resource does not exist or is outside your tenant scope. |
+| `409` | Conflict. Duplicate idempotency key is still being processed. |
+| `422` | Unprocessable Entity. Input validation failed. |
+| `429` | Too Many Requests. Rate limit exceeded. |
+| `500` | Internal Server Error. Unexpected failure; contact support. |
+
+## Pagination
+
+List endpoints use cursor-based pagination for consistent, performant results.
+
+### Request parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `cursor` | `string` | _(none)_ | Opaque cursor from a previous response. Omit for the first page. |
+| `limit` | `number` | `25` | Number of items per page. Maximum `100`. |
+
+### Response shape
+
+```json
+{
+  "data": [ ... ],
+  "nextCursor": "eyJpZCI6IjAxOTVkZTBhLTkz...",
+  "hasMore": true
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `data` | `array` | The page of results |
+| `nextCursor` | `string` or `null` | Pass this as the `cursor` parameter to fetch the next page. `null` when there are no more results. |
+| `hasMore` | `boolean` | `true` if additional pages exist |
+
+### Example
+
+```bash
+# First page
+curl https://acme.api.fyberpay.com/subscribers?limit=10
+
+# Next page
+curl https://acme.api.fyberpay.com/subscribers?limit=10&cursor=eyJpZCI6IjAxOTVkZTBhLTkz...
+```
+
+## Idempotency
+
+Mutation endpoints (POST, PUT, PATCH, DELETE) support idempotency to safely retry requests without
+causing duplicate side effects, such as double-charging a subscriber.
+
+### How it works
+
+1. Generate a unique key (a UUID v4 works well) and include it in the `Idempotency-Key` header.
+2. The server processes the request and caches the response for **24 hours**.
+3. Any subsequent request with the same key returns the cached response without re-executing the
+   operation.
+
+```bash
+curl -X POST https://acme.api.fyberpay.com/payments/initiate \
+  -H "Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000" \
+  -H "Content-Type: application/json" \
+  -d '{"subscriberId": "sub_123", "amount": 2500}'
+```
+
+### Behavior details
+
+| Scenario | Result |
+|----------|--------|
+| First request with a new key | Processed normally; response cached |
+| Repeat request with a completed key | Cached response returned (no re-processing) |
+| Repeat request while original is still processing | `409 Conflict` returned |
+| Request fails with an error | Key is cleared so you can safely retry |
+| No `Idempotency-Key` header provided | Request processed without caching (backward compatible) |
+
+<Warning>
+  Idempotency keys expire after 24 hours. If you retry a request after that window, it will be
+  processed as a new request.
+</Warning>
+
+## Webhook Delivery
+
+FyberPay delivers webhooks for payment events, subscription lifecycle changes, and network
+provisioning updates. Webhooks are sent as `POST` requests to your configured endpoint.
+
+### Delivery format
+
+```json
+{
+  "id": "evt_01H5K3XYZABC",
+  "type": "payment.succeeded",
+  "orgId": "org_01H5K3...",
+  "timestamp": "2026-03-22T10:30:00.000Z",
+  "data": {
+    "paymentId": "pay_01H5K3...",
+    "subscriberId": "sub_01H5K3...",
+    "amount": 2500,
+    "currency": "KES",
+    "gateway": "mpesa_stk"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `string` | Unique event identifier |
+| `type` | `string` | Event type (e.g., `payment.succeeded`, `subscription.activated`) |
+| `orgId` | `string` | Organization the event belongs to |
+| `timestamp` | `string` | ISO 8601 timestamp of when the event occurred |
+| `data` | `object` | Event-specific payload |
+
+### Event types
+
+| Event | Description |
+|-------|-------------|
+| `payment.succeeded` | A payment was successfully processed |
+| `payment.failed` | A payment attempt failed |
+| `invoice.created` | A new invoice was generated |
+| `subscription.activated` | A subscriber's service was activated |
+| `subscription.suspended` | A subscriber's service was suspended (dunning) |
+| `dunning.walled_garden` | A subscriber was moved to walled garden due to non-payment |
+
+### Retry policy
+
+Failed deliveries (non-2xx response or timeout) are retried with exponential backoff:
+
+- **Attempts**: Up to 5 retries
+- **Backoff**: 30s, 2m, 10m, 1h, 6h
+- **Timeout**: 10 seconds per delivery attempt
+
+Your endpoint should return a `2xx` status code within 10 seconds to acknowledge receipt. Process
+the event asynchronously if your handler needs more time.
+
+### Verifying webhooks
+
+<Info>
+  Webhook signature verification details will be published with the public API launch. Your
+  webhook endpoint should be served over HTTPS.
+</Info>

@@ -1,0 +1,220 @@
+---
+title: Subscriber Management
+description: Add subscribers, assign plans, manage upgrades/downgrades, and track lifecycle states.
+---
+
+## Overview
+
+Subscribers are the core of your ISP business. FyberPay provides tools to add subscribers individually or in bulk, assign them to service plans, manage their connection credentials, and track their full lifecycle from activation through renewal or cancellation.
+
+## Adding Subscribers
+
+### Single Subscriber
+
+<Steps>
+  <Step title="Open the subscriber form">
+    Navigate to **Subscribers > Add Subscriber** from the admin dashboard.
+  </Step>
+  <Step title="Enter subscriber details">
+    Fill in the required fields:
+    - **First name** and **Last name**
+    - **Phone number** (used for M-Pesa STK Push and SMS notifications)
+    - **Email** (optional, used for email notifications and portal login)
+  </Step>
+  <Step title="Assign a plan">
+    Select a subscription plan from the dropdown. The plan determines bandwidth limits, billing cycle, and price.
+  </Step>
+  <Step title="Configure connection credentials">
+    Choose the **access method** and provide the corresponding credentials:
+    - **PPPoE**: Set a PPPoE username and password. These are provisioned to RADIUS automatically.
+    - **Hotspot**: The subscriber authenticates via the captive portal. Credentials are their phone number or a generated voucher code.
+    - **Static IP**: Provide a PPPoE username/password plus a static IP address. FyberPay sets the `Framed-IP-Address` in RADIUS.
+  </Step>
+  <Step title="Save and activate">
+    Click **Save**. The subscription starts in **pending** status. You can activate it immediately or wait for the first payment to trigger activation automatically.
+  </Step>
+</Steps>
+
+<Info>
+  PPPoE usernames must be unique across your organization. FyberPay validates uniqueness when you create or update a subscription.
+</Info>
+
+### Bulk CSV Import
+
+For onboarding large numbers of subscribers at once, use the bulk import feature.
+
+<Steps>
+  <Step title="Download the CSV template">
+    Go to **Subscribers > Import** and click **Download Template**. The template includes all required and optional columns.
+  </Step>
+  <Step title="Fill in subscriber data">
+    Populate the CSV with your subscriber records. Required columns:
+    - `firstName`, `lastName`, `phone`
+    - `planName` (must match an existing plan name exactly)
+    - `pppoeUsername`, `pppoePassword` (for PPPoE subscribers)
+
+    Optional columns:
+    - `email`, `accessMethod`, `staticIp`, `autoRenew`
+  </Step>
+  <Step title="Upload and preview">
+    Upload the CSV file. FyberPay validates each row and shows a preview with any errors highlighted (duplicate usernames, invalid phone numbers, unrecognized plan names).
+  </Step>
+  <Step title="Confirm import">
+    Review the preview and click **Import**. FyberPay creates subscriber accounts, subscriptions, and provisions RADIUS credentials for each valid row.
+  </Step>
+</Steps>
+
+<Warning>
+  The CSV import processes rows sequentially. If a row fails (for example, a duplicate PPPoE username), that row is skipped and the error is reported. Other rows continue processing normally.
+</Warning>
+
+## Plan Assignment
+
+Every subscriber has exactly one active subscription at a time. The subscription links the subscriber to a plan, which defines:
+
+| Property | Description |
+|---|---|
+| **Name** | Display name (e.g., "Home Basic 10Mbps") |
+| **Speed (down/up)** | Download and upload bandwidth in Mbps |
+| **Price** | Recurring charge per billing cycle |
+| **Billing cycle** | Duration in days (30, 90, 365, etc.) |
+| **RADIUS group** | Auto-generated group name used for bandwidth enforcement |
+| **Burst settings** | Optional burst limit, threshold, and time for MikroTik queues |
+
+When a plan is assigned, FyberPay automatically syncs the RADIUS group reply attributes (Mikrotik-Rate-Limit) so bandwidth is enforced immediately on the subscriber's next connection.
+
+## Plan Changes
+
+### Upgrades
+
+To upgrade a subscriber to a higher plan:
+
+1. Navigate to **Subscribers > [Subscriber Name] > Subscription**
+2. Click **Change Plan**
+3. Select the new (higher) plan
+4. FyberPay calculates the **prorated charge** for the remaining days in the current cycle
+
+<Accordion title="Proration example">
+  A subscriber on the KES 2,000/month plan with 15 days remaining upgrades to KES 3,500/month.
+
+  - Old daily rate: KES 2,000 / 30 = KES 66.67
+  - New daily rate: KES 3,500 / 30 = KES 116.67
+  - Daily difference: KES 50.00
+  - Proration charge: KES 50.00 x 15 = **KES 750**
+
+  An invoice for KES 750 is generated for the upgrade. The subscriber's RADIUS group is updated immediately, so they get the higher bandwidth right away.
+</Accordion>
+
+### Downgrades
+
+Downgrades work the same way, but in reverse. The proration calculation produces a credit that is applied to the subscriber's next invoice.
+
+<Info>
+  Both upgrades and downgrades take effect immediately. RADIUS attributes are updated in real-time, so the subscriber's bandwidth changes within seconds of the plan change being saved.
+</Info>
+
+## Connection Credentials
+
+### PPPoE Credentials
+
+PPPoE subscribers connect using a username and password. FyberPay provisions these credentials to the RADIUS database:
+
+- **Cleartext-Password**: Used for PAP and CHAP authentication
+- **NT-Password**: MD4 hash of the password, used for MS-CHAPv2 authentication (required by most MikroTik PPPoE configurations)
+
+To update a subscriber's PPPoE credentials, go to **Subscribers > [Name] > Subscription > Edit Connection** and change the username or password. RADIUS is updated automatically.
+
+### Static IP Assignment
+
+For subscribers who need a fixed IP address:
+
+1. Set the access method to **Static IP**
+2. Enter the PPPoE username/password as usual
+3. Enter the static IP address in the **Static IP** field
+
+FyberPay writes the `Framed-IP-Address` attribute to the RADIUS `radreply` table. The subscriber receives this IP on every PPPoE session.
+
+<Warning>
+  Ensure the static IP address is within a pool that is not assigned to your DHCP or dynamic IP pool on the router. Overlapping addresses will cause connection failures.
+</Warning>
+
+## Subscriber Lifecycle States
+
+Each subscription moves through a defined set of states. Transitions are enforced by a state machine, so invalid transitions (for example, jumping from "pending" to "expired") are rejected.
+
+### State Diagram
+
+```
+pending -> active -> expired -> active (renewal)
+              |                    |
+              v                    v
+          suspended           (dunning)
+              |
+              v
+          cancelled
+```
+
+### State Definitions
+
+| State | Meaning | Internet Access |
+|---|---|---|
+| **Pending** | Subscription created, awaiting first payment or manual activation | No |
+| **Active** | Subscription is live, within the billing cycle | Full speed |
+| **Expired** | Billing cycle ended without renewal payment | Walled garden (restricted) |
+| **Suspended** | Manually suspended by admin, or by the dunning pipeline after prolonged non-payment | None |
+| **Cancelled** | Permanently deactivated. Terminal state. | None |
+
+### Valid Transitions
+
+| From | Allowed Transitions |
+|---|---|
+| Pending | Active, Cancelled |
+| Active | Expired, Suspended, Cancelled |
+| Expired | Active (on payment) |
+| Suspended | Active (on payment or manual reactivation), Cancelled |
+| Cancelled | (none, terminal state) |
+
+## Suspension and Reactivation
+
+### Manual Suspension
+
+Admins can suspend a subscriber at any time from **Subscribers > [Name] > Actions > Suspend**. When suspended:
+
+- The subscriber's RADIUS group is changed to `walled-garden`, restricting access
+- The subscriber receives an SMS and email notification
+- The subscription remains in the system and can be reactivated
+
+### Reactivation
+
+To reactivate a suspended subscriber:
+
+1. Navigate to **Subscribers > [Name] > Actions > Reactivate**
+2. If the subscriber has an outstanding invoice, they must pay it first (via STK Push or manual payment)
+3. On reactivation, FyberPay restores the subscriber's RADIUS group to their plan and extends the expiry date
+
+<Info>
+  When a payment is received for a suspended or walled-garden subscriber, FyberPay automatically reactivates the subscription, resets the dunning state, and restores full internet access. No manual intervention is needed.
+</Info>
+
+## Subscriber Self-Service Portal
+
+Every subscriber can access their self-service portal at `yourorg.fyberpay.com/portal`. The portal allows subscribers to:
+
+- View their current plan and expiry date
+- See invoice history and payment receipts
+- Initiate M-Pesa STK Push payments
+- View bandwidth usage statistics
+- Update their contact information
+
+Subscribers log in using their email address and an OTP sent to their email.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Network Provisioning" icon="network-wired" href="/guides/network-provisioning">
+    Understand how RADIUS, PPPoE, and bandwidth shaping work behind the scenes.
+  </Card>
+  <Card title="Billing Setup" icon="file-invoice-dollar" href="/guides/billing-setup">
+    Configure invoicing, payment terms, and tax settings.
+  </Card>
+</CardGroup>

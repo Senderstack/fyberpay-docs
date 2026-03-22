@@ -1,0 +1,225 @@
+---
+title: M-Pesa Integration
+description: Set up Daraja API credentials, STK Push, Bill Manager, and payment reconciliation.
+---
+
+## Overview
+
+FyberPay integrates with Safaricom's Daraja API to accept M-Pesa payments from your subscribers. There are two payment channels:
+
+- **STK Push (M-Pesa Express)**: FyberPay sends a payment prompt directly to the subscriber's phone. They enter their PIN and the payment is processed instantly.
+- **Bill Manager**: FyberPay pushes invoices to Safaricom's Bill Manager platform. Subscribers receive SMS invoices and can pay via the M-Pesa app or USSD.
+
+Both channels can operate simultaneously. STK Push is used for on-demand payments (subscriber portal, dunning retries). Bill Manager is used for invoice-based billing.
+
+## Prerequisites
+
+Before configuring M-Pesa in FyberPay, you need:
+
+1. A **Safaricom Daraja developer account** at [developer.safaricom.co.ke](https://developer.safaricom.co.ke)
+2. A registered **Paybill** or **Till** number
+3. An approved **Daraja app** with M-Pesa Express (Lipa Na M-Pesa) enabled
+4. The **Passkey** for your shortcode (provided by Safaricom after go-live)
+
+<Warning>
+  Start with the Daraja **sandbox** environment to test your integration before switching to production. Sandbox credentials use test phone numbers and do not process real money.
+</Warning>
+
+## Setting Up Daraja Credentials
+
+<Steps>
+  <Step title="Create a Daraja app">
+    Log in to [developer.safaricom.co.ke](https://developer.safaricom.co.ke) and create a new app. Enable the following APIs:
+    - M-Pesa Express (Lipa Na M-Pesa)
+    - C2B (Customer to Business)
+
+    Copy the **Consumer Key** and **Consumer Secret** from your app dashboard.
+  </Step>
+  <Step title="Enter credentials in FyberPay">
+    Navigate to **Settings > Payment Gateways > M-Pesa** and fill in:
+    - **Consumer Key**: from your Daraja app
+    - **Consumer Secret**: from your Daraja app
+    - **Shortcode**: your Paybill or Till number
+    - **Passkey**: provided by Safaricom for STK Push
+    - **Environment**: `sandbox` for testing, `production` for live payments
+  </Step>
+  <Step title="Save and verify">
+    Click **Save**. FyberPay validates your credentials by requesting an OAuth token from the Daraja API. If the credentials are invalid, you will see an error message.
+  </Step>
+  <Step title="Send a test STK Push">
+    Use the **Send Test STK Push** button to trigger a payment prompt to your phone. In sandbox mode, this uses Safaricom's test numbers.
+  </Step>
+</Steps>
+
+<Info>
+  FyberPay encrypts your Daraja credentials at rest using AES-256 encryption. Credentials are never stored in plaintext and are only decrypted when making API calls.
+</Info>
+
+## STK Push Configuration
+
+STK Push (also called Lipa Na M-Pesa Online) sends a payment prompt directly to the subscriber's phone. The flow works like this:
+
+1. FyberPay sends an STK Push request to Daraja with the subscriber's phone number and amount
+2. The subscriber receives a popup on their phone asking them to enter their M-Pesa PIN
+3. Safaricom processes the payment and sends a callback to FyberPay
+4. FyberPay matches the payment to the invoice, marks it as paid, and extends the subscription
+
+### Callback URL
+
+FyberPay automatically configures the callback URL for STK Push responses. The URL follows this pattern:
+
+```
+https://api.fyberpay.com/v1/payments/webhooks/mpesa/stk-callback
+```
+
+<Warning>
+  The callback URL must be publicly accessible over HTTPS. If you are running FyberPay behind a firewall, ensure port 443 is open for inbound requests from Safaricom's IP ranges.
+</Warning>
+
+### STK Push Polling
+
+If the callback is delayed or missed, FyberPay polls the Daraja STK Query API to check the transaction status. The poller runs automatically and handles these result codes:
+
+| Result Code | Meaning | FyberPay Action |
+|---|---|---|
+| 0 | Success | Mark payment as successful |
+| 1032 | Cancelled by user | Mark payment as cancelled |
+| 1019 | Transaction in progress | Retry poll later |
+| 1025 | Transaction timed out | Retry poll later |
+| 1037 | Insufficient balance | Retry poll later |
+| Other | Failed | Mark payment as failed |
+
+## C2B Validation
+
+C2B (Customer to Business) handles payments that subscribers initiate themselves through M-Pesa, such as:
+
+- Paying via the M-Pesa app using your Paybill number
+- Sending money via USSD (`*334#`)
+- Paying at an M-Pesa agent
+
+FyberPay registers validation and confirmation URLs with Safaricom:
+
+- **Validation URL**: FyberPay checks the account reference to determine if the payment can be accepted
+- **Confirmation URL**: After payment, FyberPay matches the transaction to a subscriber and invoice
+
+### Account Reference Format
+
+Subscribers must use their account reference when paying via C2B. The reference format is:
+
+```
+{org-slug}-{invoice-number}
+```
+
+For example, a subscriber of "Acme Internet" paying invoice ACM-0042 would use:
+
+```
+Account Number: acme-ACM-0042
+```
+
+<Tip>
+  Include the account reference format in your subscriber onboarding SMS and on the subscriber portal. This reduces mismatched payments.
+</Tip>
+
+## Bill Manager
+
+Bill Manager pushes structured invoices to Safaricom, which then sends SMS notifications to subscribers with a direct payment option.
+
+### How Bill Manager Works
+
+1. FyberPay generates an invoice for a subscription renewal
+2. The `invoice.created` event triggers the Bill Manager sync listener
+3. FyberPay pushes the invoice to Safaricom's Bill Manager API
+4. The subscriber receives an SMS: "You have a bill of KES X from [Your ISP]. Pay via M-Pesa."
+5. When the subscriber pays, Safaricom sends a callback to FyberPay
+6. FyberPay acknowledges the payment (triggers an e-receipt to the subscriber)
+
+### Enabling Bill Manager
+
+Navigate to **Settings > Payment Gateways > M-Pesa** and enable the **Bill Manager** toggle. Bill Manager uses the same Daraja credentials as STK Push but requires your shortcode to be enrolled in the Bill Manager program.
+
+<Info>
+  Bill Manager enrollment is done through Safaricom. Contact your Safaricom relationship manager to register your Paybill number for Bill Manager. FyberPay handles the API integration once your shortcode is enrolled.
+</Info>
+
+### Bulk Invoice Push
+
+Bill Manager supports pushing up to 1,000 invoices per batch. FyberPay handles batching automatically. When the bulk invoice generation job runs (for subscriptions expiring within 3 days), all generated invoices are queued for Bill Manager push.
+
+## Payment Reconciliation
+
+FyberPay automatically reconciles payments from all M-Pesa channels:
+
+<AccordionGroup>
+  <Accordion title="STK Push payments">
+    Matched automatically via the `CheckoutRequestID` returned by Daraja. Every STK Push request is tracked and matched to the originating invoice.
+  </Accordion>
+  <Accordion title="C2B payments">
+    Matched via the account reference in the C2B callback. FyberPay parses the reference to extract the org slug and invoice number, then allocates the payment.
+  </Accordion>
+  <Accordion title="Bill Manager payments">
+    Matched via the `accountReference` field in the Bill Manager payment notification. FyberPay looks up the org and invoice, creates a payment log, and sends an acknowledgment to Safaricom (which triggers the customer e-receipt).
+  </Accordion>
+  <Accordion title="Unmatched payments">
+    If a payment cannot be matched to a subscriber or invoice (for example, the subscriber used an incorrect account reference), FyberPay logs it as an unmatched payment. You can view and manually allocate unmatched payments from **Billing > Unmatched Payments**.
+  </Accordion>
+</AccordionGroup>
+
+### What Happens After Payment
+
+When a payment is successfully matched and processed:
+
+1. The invoice is marked as **paid** with the M-Pesa receipt number
+2. The subscription is extended by the plan's billing cycle days
+3. If the subscriber was in a dunning state (retrying, walled garden, or suspended), dunning is reset
+4. RADIUS credentials are restored to the subscriber's plan group (if they were in walled garden)
+5. The subscriber receives a payment confirmation via SMS and email
+
+## Troubleshooting
+
+### Common Daraja Errors
+
+<AccordionGroup>
+  <Accordion title="Invalid shortcode (error 174)">
+    Your shortcode is not registered for M-Pesa Express on Daraja. Verify at [developer.safaricom.co.ke](https://developer.safaricom.co.ke) that your app has the correct shortcode associated and that M-Pesa Express is enabled.
+  </Accordion>
+  <Accordion title="Request timeout">
+    The Daraja API did not respond within the timeout window. This is usually a temporary Safaricom outage. FyberPay uses circuit breakers to handle this gracefully. The payment will be retried automatically if it was part of a dunning cycle.
+  </Accordion>
+  <Accordion title="Insufficient balance (result code 1)">
+    The subscriber does not have enough M-Pesa balance to complete the transaction. FyberPay marks this as a failed payment. The dunning pipeline will retry based on your configured intervals.
+  </Accordion>
+  <Accordion title="OAuth token failure">
+    FyberPay could not obtain an access token from Daraja. Verify that your Consumer Key and Consumer Secret are correct. Tokens are cached for approximately 5 minutes and refreshed automatically.
+  </Accordion>
+  <Accordion title="Wrong credentials (invalid consumer key/secret)">
+    Double-check that you are using credentials from the correct Daraja app and environment. Sandbox and production use different credentials.
+  </Accordion>
+  <Accordion title="Callback not received">
+    If STK Push callbacks are not arriving, verify that your server's HTTPS endpoint is publicly reachable. FyberPay falls back to STK Query polling, so payments will still be captured, but with a slight delay.
+  </Accordion>
+</AccordionGroup>
+
+### Testing in Sandbox
+
+Safaricom provides test credentials and phone numbers for sandbox testing:
+
+| Parameter | Sandbox Value |
+|---|---|
+| Test phone number | 254708374149 |
+| Shortcode | 174379 |
+| Environment | `sandbox` |
+
+<Warning>
+  Remember to switch the environment from `sandbox` to `production` before going live. Sandbox payments are simulated and do not move real money.
+</Warning>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Billing Setup" icon="file-invoice-dollar" href="/guides/billing-setup">
+    Configure invoicing, tax settings, and billing cycles.
+  </Card>
+  <Card title="Dunning Automation" icon="bell" href="/guides/dunning-automation">
+    Automate payment retries and service restriction for overdue accounts.
+  </Card>
+</CardGroup>

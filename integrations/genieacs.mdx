@@ -1,0 +1,393 @@
+---
+title: "GenieACS (TR-069)"
+description: "Auto-provision and manage subscriber CPE devices using GenieACS for remote WiFi config, firmware updates, and diagnostics."
+---
+
+FyberPay integrates with [GenieACS](https://genieacs.com), an open-source TR-069 (CWMP) auto-configuration server, to remotely manage subscriber CPE devices. This enables ISPs to provision ONTs, routers, and access points without truck rolls.
+
+## Architecture
+
+```
+Subscriber CPE            GenieACS                    FyberPay
++----------+             +-----------+               +------------------+
+|  ONT /   |-- TR-069 -->| CWMP (7547|               | CpeManagement    |
+|  Router  |  (HTTPS)    | NBI  7557)|<-- REST API ->| Controller       |
++----------+             | FS   7567)|               +------------------+
+                         +-----------+               | GenieAcsService  |
+                               |                     | BootstrapService |
+                               |                     | SyncProcessor    |
+                          MongoDB                    | FaultPollProc    |
+                                                     +------------------+
+```
+
+FyberPay communicates with GenieACS through the **NBI (Northbound Interface)** REST API on port 7557. CPE devices connect to GenieACS via the CWMP protocol on port 7547. The GenieACS File Server on port 7567 serves firmware images and diagnostic files.
+
+## Supported Device Types
+
+FyberPay works with any TR-069 compliant device. Common device types in East African ISP deployments:
+
+| Device Type | Examples | Common Use Case |
+|-------------|----------|-----------------|
+| GPON ONTs | Huawei HG8245H, ZTE F660, Nokia G-240W-A | Fiber-to-the-home (FTTH) |
+| Wireless routers | TP-Link Archer, Tenda, Netis | Last-mile WiFi |
+| ONU/ONTs | V-SOL, VSOL, C-Data | Fiber access network |
+| Mesh systems | TP-Link Deco, Tenda Nova | Multi-room coverage |
+
+## Auto-Discovery and Registration
+
+When a CPE device first connects to GenieACS (BOOTSTRAP event), FyberPay automatically identifies and registers it.
+
+<Steps>
+  <Step title="Device connects to GenieACS">
+    The CPE sends its first Inform message to GenieACS. GenieACS triggers the `0 BOOTSTRAP` event.
+  </Step>
+
+  <Step title="Bootstrap provision runs">
+    FyberPay uploads a bootstrap provision script to GenieACS on startup. This script runs on every new device:
+
+    ```javascript
+    let serial = declare("Device.DeviceInfo.SerialNumber", {value: 1});
+    let oui = declare("Device.DeviceInfo.ManufacturerOUI", {value: 1});
+    let productClass = declare("Device.DeviceInfo.ProductClass", {value: 1});
+
+    let config = ext("fyberpay", "identifyDevice",
+      serial.value[0], oui.value[0], productClass.value[0]);
+    ```
+
+    The `ext()` call hits FyberPay's internal API to look up the device by serial number.
+  </Step>
+
+  <Step title="Device identification">
+    FyberPay checks if the device's serial number matches any known CPE in the database:
+
+    - **Known device (assigned to an org and subscriber)**: Tags are applied for the organization, subscriber username, and plan. PPPoE credentials are pushed to the device.
+    - **Known device (assigned to org, no subscriber)**: Only the organization tag is applied.
+    - **Unknown device**: A new CPE record is created with `orgId = null` and appears in the **Pending Devices** list.
+  </Step>
+
+  <Step title="Periodic inform configured">
+    The bootstrap script sets the periodic inform interval to 300 seconds (5 minutes):
+
+    ```javascript
+    declare("Device.ManagementServer.PeriodicInformEnable", {value: 1}, {value: true});
+    declare("Device.ManagementServer.PeriodicInformInterval", {value: 1}, {value: 300});
+    ```
+
+    This ensures FyberPay receives regular health updates from every managed device.
+  </Step>
+</Steps>
+
+## Device Claiming and Assignment
+
+<Tabs>
+  <Tab title="ISP Admin Claims Device">
+    ISP administrators can claim unassigned devices from the **Pending Devices** list. Claiming assigns the device to the ISP's organization.
+
+    ```
+    POST /cpe/pending/:id/claim
+    ```
+
+    This publishes a `cpe.claimed` event through the outbox.
+  </Tab>
+  <Tab title="Platform Admin Assigns Device">
+    Super admins can assign devices to any organization, optionally linking them to a specific subscriber:
+
+    ```
+    POST /cpe/pending/:id/assign
+    { "orgId": "org-uuid", "userId": "user-uuid" }
+    ```
+
+    This publishes a `cpe.assigned` event through the outbox.
+  </Tab>
+</Tabs>
+
+## Subscriber Assignment and PPPoE Provisioning
+
+When a CPE device is assigned to a subscriber, FyberPay pushes the subscriber's PPPoE credentials directly to the device via TR-069:
+
+```javascript
+// Parameters pushed to the CPE
+Device.PPP.Interface.1.Username = "subscriber_username"
+Device.PPP.Interface.1.Password = "subscriber_password"
+Device.PPP.Interface.1.Enable = true
+```
+
+FyberPay also applies GenieACS tags for tracking:
+- `sub:username` to link the device to the subscriber
+- `plan:group-name` to indicate which service plan the device is on
+
+When a device is reassigned to a different subscriber, the old tags are removed and new ones are applied.
+
+## Remote Configuration
+
+### WiFi Settings
+
+Update a device's WiFi SSID and password remotely:
+
+```
+POST /cpe/devices/:id/wifi
+{
+  "ssid": "MyHomeWiFi",
+  "password": "SecurePass123"
+}
+```
+
+FyberPay sends the following TR-069 parameters:
+
+| Parameter | Value |
+|-----------|-------|
+| `Device.WiFi.SSID.1.SSID` | The new SSID |
+| `Device.WiFi.AccessPoint.1.Security.KeyPassphrase` | The new WPA2 password |
+
+<Info>
+WiFi passwords must be at least 8 characters (WPA2 minimum requirement). FyberPay validates this before sending the task to GenieACS.
+</Info>
+
+### Custom Parameter Configuration
+
+For advanced use cases, FyberPay can set arbitrary TR-069 parameters on any device:
+
+```javascript
+// Via GenieAcsService.setParameters()
+await genieAcs.setParameters(deviceId, [
+  ["Device.DNS.Client.Server.1.DNSServer", "8.8.8.8"],
+  ["Device.DNS.Client.Server.2.DNSServer", "8.8.4.4"],
+], true);  // true = send connection request
+```
+
+The `connection_request` flag tells GenieACS to wake up the device immediately rather than waiting for the next periodic inform.
+
+## Firmware Management
+
+### Uploading Firmware
+
+Upload firmware images to the GenieACS file server for later deployment:
+
+```
+POST /cpe/firmware/upload
+{
+  "filename": "HG8245H_V3R017C10S135.bin",
+  "oui": "00259E",
+  "productClass": "HG8245H",
+  "version": "V3R017C10S135",
+  "data": "<base64-encoded-firmware>"
+}
+```
+
+Firmware metadata (OUI, product class, version) is stored alongside the file so GenieACS can match firmware to compatible devices.
+
+### Deploying Firmware
+
+Push firmware updates to all devices of a specific model within an organization:
+
+```
+POST /cpe/firmware/deploy
+{
+  "filename": "HG8245H_V3R017C10S135.bin",
+  "model": "HG8245H"
+}
+```
+
+FyberPay sends a `download` task to each matching device. GenieACS instructs the CPE to download and install the firmware via TR-069.
+
+<Warning>
+Firmware updates cause a device reboot. Schedule deployments during off-peak hours. The deploy endpoint returns the count of succeeded and failed tasks so you can monitor progress.
+</Warning>
+
+## Diagnostics
+
+### Speed Test
+
+Trigger a download speed test on a CPE device:
+
+```
+POST /cpe/devices/:id/speed-test
+{
+  "downloadUrl": "http://genieacs:7567/fyberpay-speedtest-10MB.bin"
+}
+```
+
+FyberPay automatically uploads a 10MB random binary file to the GenieACS file server for speed testing. If no `downloadUrl` is provided, this default file is used.
+
+The CPE uses TR-069 Download Diagnostics to measure throughput:
+
+| Parameter | Value |
+|-----------|-------|
+| `Device.IP.Diagnostics.DownloadDiagnostics.DownloadURL` | Test file URL |
+| `Device.IP.Diagnostics.DownloadDiagnostics.DiagnosticsState` | `Requested` |
+
+### Ping Test
+
+Run a ping diagnostic from the CPE to a target host:
+
+| Parameter | Value |
+|-----------|-------|
+| `Device.IP.Diagnostics.IPPing.Host` | Target hostname or IP |
+| `Device.IP.Diagnostics.IPPing.NumberOfRepetitions` | `10` |
+| `Device.IP.Diagnostics.IPPing.Timeout` | `5000` (ms) |
+| `Device.IP.Diagnostics.IPPing.DiagnosticsState` | `Requested` |
+
+### Retrieving Diagnostic Results
+
+```
+GET /cpe/devices/:id/diagnostics
+```
+
+Returns the latest download, upload, and ping diagnostic results stored on the device.
+
+## Health Monitoring
+
+FyberPay uploads a health check provision that runs on every periodic inform (every 5 minutes):
+
+```javascript
+declare("Device.DeviceInfo.UpTime", {value: 1});
+declare("Device.DeviceInfo.SoftwareVersion", {value: 1});
+declare("Device.DeviceInfo.MemoryStatus.Free", {value: 1});
+declare("Device.DeviceInfo.ProcessStatus.CPUUsage", {value: 1});
+declare("Device.IP.Interface.1.Stats.BytesSent", {value: 1});
+declare("Device.IP.Interface.1.Stats.BytesReceived", {value: 1});
+declare("Device.WiFi.AccessPoint.1.AssociatedDeviceNumberOfEntries", {value: 1});
+```
+
+This data feeds the CPE dashboard:
+
+| Metric | Source |
+|--------|--------|
+| Online/offline status | Last inform timestamp (offline if > 10 minutes ago) |
+| Firmware version | `Device.DeviceInfo.SoftwareVersion` |
+| Uptime | `Device.DeviceInfo.UpTime` |
+| CPU usage | `Device.DeviceInfo.ProcessStatus.CPUUsage` |
+| Free memory | `Device.DeviceInfo.MemoryStatus.Free` |
+| Traffic stats | `Device.IP.Interface.1.Stats.BytesSent/BytesReceived` |
+| Connected WiFi clients | `Device.WiFi.AccessPoint.1.AssociatedDeviceNumberOfEntries` |
+
+### Dashboard Endpoint
+
+```
+GET /cpe/dashboard
+```
+
+Returns aggregate stats for all CPE devices in the organization:
+
+```json
+{
+  "total": 245,
+  "online": 198,
+  "offline": 47,
+  "staleDevices": 12,
+  "firmwareCounts": {
+    "V3R017C10S135": 180,
+    "V3R016C10S120": 53,
+    "Unknown": 12
+  }
+}
+```
+
+`staleDevices` counts devices that have been offline for more than 1 hour.
+
+## Background Sync
+
+FyberPay runs two BullMQ background processors for GenieACS:
+
+<AccordionGroup>
+  <Accordion title="Device Sync (genieacs-sync)">
+    Periodically fetches all devices from GenieACS and syncs them with FyberPay's database. Updates:
+    - Last inform timestamp
+    - Online/offline status
+    - Firmware version
+    - Manufacturer and model
+
+    New devices discovered in GenieACS that are not in FyberPay's database are auto-created as unassigned CPE records.
+  </Accordion>
+
+  <Accordion title="Fault Polling (genieacs-fault-poll)">
+    Periodically polls GenieACS for active faults and matches them to known CPE devices. Faults are logged with the device serial number and organization for visibility.
+
+    Faults can be viewed and cleared from the admin dashboard:
+
+    ```
+    GET  /cpe/faults          # List faults for the organization
+    POST /cpe/faults/:id/clear  # Clear a specific fault
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Custom Provisions
+
+ISP administrators can upload custom provisioning scripts that run on their devices:
+
+```
+PUT /cpe/provisions/:name
+{
+  "script": "declare('Device.WiFi.Radio.1.Channel', {value: 1}, {value: 6});"
+}
+```
+
+Custom provisions are namespaced with the organization slug to prevent collisions between ISPs: `acme-custom-provision`.
+
+## Device Management Actions
+
+| Action | Endpoint | Effect |
+|--------|----------|--------|
+| Reboot | `POST /cpe/devices/:id/reboot` | Sends a TR-069 reboot command |
+| Factory Reset | `POST /cpe/devices/:id/factory-reset` | Restores device to factory defaults |
+| WiFi Config | `POST /cpe/devices/:id/wifi` | Updates SSID and password |
+| Speed Test | `POST /cpe/devices/:id/speed-test` | Triggers download diagnostics |
+| Assign Subscriber | `POST /cpe/devices/:id/assign-subscriber` | Links device to a subscriber and pushes PPPoE credentials |
+
+All write operations are recorded in FyberPay's audit log.
+
+## Required Environment Variables
+
+```bash
+# GenieACS NBI URL (Northbound Interface)
+GENIEACS_NBI_URL=http://genieacs:7557
+
+# GenieACS File Server URL (for firmware and speed test files)
+GENIEACS_FS_URL=http://genieacs:7567
+
+# Internal API key for GenieACS ext() callbacks
+GENIEACS_INTERNAL_KEY=your_internal_api_key
+```
+
+<Tip>
+If `GENIEACS_NBI_URL` is not set, FyberPay skips all GenieACS bootstrap operations on startup. Set this variable to enable CPE management.
+</Tip>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Device not appearing in Pending Devices">
+    1. Verify the CPE is connecting to GenieACS: check `GET /devices/` on the GenieACS NBI (port 7557)
+    2. Confirm the bootstrap provision is uploaded: `GET /provisions/fyberpay-bootstrap`
+    3. Check that `GENIEACS_INTERNAL_KEY` matches between GenieACS ext script config and FyberPay's env
+    4. Review FyberPay API logs for the internal `/internal/cpe/identify` endpoint
+  </Accordion>
+
+  <Accordion title="PPPoE credentials not pushed to device">
+    1. Confirm the device is assigned to a subscriber who has an active subscription
+    2. Check that the subscription has PPPoE credentials set (username and encrypted password)
+    3. Verify GenieACS can reach the device (check for connection request failures in GenieACS faults)
+    4. Try manually triggering a connection request from the GenieACS UI
+  </Accordion>
+
+  <Accordion title="Firmware update stuck">
+    1. Check the task status in GenieACS: `GET /tasks/?query={"device":"device-id"}`
+    2. Look for faults related to the device: `GET /faults/?query={"device":"device-id"}`
+    3. Verify the firmware file exists in GenieACS: `GET /files/`
+    4. Confirm the firmware OUI and product class match the target device
+    5. Some devices require a reboot before accepting firmware; try rebooting first
+  </Accordion>
+
+  <Accordion title="Device shows as offline">
+    A device is considered offline if its last inform was more than 10 minutes ago. Possible causes:
+    - Device lost power or internet connectivity
+    - The periodic inform interval was not set (bootstrap did not run)
+    - GenieACS cannot reach the device for connection requests (NAT or firewall issues)
+    - The device sync processor has not run recently
+  </Accordion>
+
+  <Accordion title="Circuit breaker open for GenieACS">
+    All GenieACS API calls are wrapped in a circuit breaker. If GenieACS is down or consistently returning errors, the circuit opens and FyberPay stops sending requests temporarily. Check GenieACS container health: `docker logs genieacs`.
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,273 @@
+---
+title: Hotspot Setup
+description: Configure captive portal hotspots with login pages, vouchers, and bandwidth packages.
+---
+
+## Overview
+
+FyberPay supports hotspot-based internet access alongside PPPoE. Hotspots use a captive portal (login page) where subscribers authenticate before gaining internet access. This is ideal for public Wi-Fi locations, apartment complexes, and pay-as-you-go internet cafes.
+
+Hotspot authentication flows through the same RADIUS infrastructure as PPPoE, so billing, dunning, and provisioning all work identically.
+
+## MikroTik Hotspot Server Setup
+
+<Steps>
+  <Step title="Create a hotspot interface">
+    On your MikroTik router, go to **IP > Hotspot > Hotspot Setup** and run the wizard on your subscriber-facing interface (bridge or WLAN).
+
+    Alternatively, FyberPay can configure the hotspot server remotely. Navigate to **Network > [Router] > Setup PPPoE** and select the **Hotspot** option instead.
+  </Step>
+  <Step title="Point RADIUS to FyberPay">
+    Configure the MikroTik hotspot server to authenticate against FreeRADIUS:
+
+    ```
+    /radius
+    add address=<freeradius-ip> secret=<shared-secret> service=hotspot
+    ```
+
+    Ensure the RADIUS shared secret matches the one configured in your FreeRADIUS `clients.conf`.
+  </Step>
+  <Step title="Enable RADIUS authentication on the hotspot">
+    Under **IP > Hotspot > Server Profiles**, edit your hotspot profile:
+    - Set **Use RADIUS** to `yes`
+    - Set **RADIUS Accounting** to `yes`
+    - Set **RADIUS Interim Update** to a suitable interval (e.g., 5 minutes)
+  </Step>
+  <Step title="Configure the IP pool">
+    Create an IP pool for hotspot clients:
+
+    ```
+    /ip pool
+    add name=hotspot-pool ranges=10.10.0.2-10.10.0.254
+    ```
+
+    Assign this pool to the hotspot server profile.
+  </Step>
+</Steps>
+
+<Info>
+  FyberPay uses the same RADIUS database for both PPPoE and hotspot authentication. Subscribers with access method set to "hotspot" are provisioned identically in `radcheck` and `radusergroup`, but they authenticate through the captive portal instead of a PPPoE client.
+</Info>
+
+## Login Page Customization
+
+MikroTik hotspot servers serve a captive portal login page to unauthenticated clients. You can customize this page to match your brand and integrate FyberPay payment flows.
+
+### Default Login Flow
+
+1. Subscriber connects to the Wi-Fi network
+2. On opening a browser, they are redirected to the hotspot login page
+3. They enter their username (phone number) and password (voucher code or account password)
+4. MikroTik authenticates via RADIUS
+5. On success, the subscriber gains internet access with the bandwidth limits from their plan
+
+### Custom Login Page
+
+Upload a custom `login.html` to your MikroTik router at **Files > hotspot/login.html**. Key elements to include:
+
+- Your ISP branding (logo, colors)
+- A login form with username and password fields
+- A link to purchase a voucher or create an account via the FyberPay portal
+- The FyberPay payment page URL for direct M-Pesa purchases
+
+<Tip>
+  Include a "Buy with M-Pesa" button on your login page that links to `https://yourorg.fyberpay.com/portal/buy`. This allows walk-in customers to purchase a package and receive credentials instantly.
+</Tip>
+
+### Login Page Variables
+
+MikroTik injects variables into the login page that you can use for dynamic content:
+
+| Variable | Description |
+|---|---|
+| `$(identity)` | Router name |
+| `$(login-by)` | Authentication method |
+| `$(error)` | Error message on failed login |
+| `$(error-orig)` | Original error message |
+| `$(ip)` | Client IP address |
+| `$(mac)` | Client MAC address |
+
+## Voucher and Package Management
+
+### Creating Hotspot Packages
+
+Hotspot packages are created as regular plans in FyberPay. Navigate to **Billing > Plans** and create a plan with these considerations:
+
+<Tabs>
+  <Tab title="Time-based packages">
+    For hourly or daily access:
+    - Set **Billing Cycle** to the access duration (e.g., 1 day = 1 billing cycle day)
+    - Set **Speed** to the desired bandwidth
+    - Set **Price** to the package cost
+
+    Examples:
+    | Package | Speed | Duration | Price |
+    |---|---|---|---|
+    | 1 Hour | 5 Mbps | 1 day | KES 20 |
+    | Daily | 10 Mbps | 1 day | KES 50 |
+    | Weekly | 10 Mbps | 7 days | KES 200 |
+    | Monthly | 20 Mbps | 30 days | KES 1,000 |
+  </Tab>
+  <Tab title="Data-cap packages">
+    For volume-based access, configure data caps on your MikroTik router using simple queues or RADIUS attributes. FyberPay handles the billing side; the data cap enforcement is done at the router level.
+
+    Set up a queue rule on MikroTik that monitors bytes transferred and disconnects the session when the cap is reached.
+  </Tab>
+</Tabs>
+
+### Generating Vouchers
+
+Vouchers are pre-generated credentials that subscribers use to log in to the hotspot. Each voucher is a one-time-use code tied to a specific package.
+
+<Steps>
+  <Step title="Navigate to voucher management">
+    Go to **Billing > Vouchers** in the admin dashboard.
+  </Step>
+  <Step title="Select a package">
+    Choose the hotspot plan that vouchers should be generated for.
+  </Step>
+  <Step title="Set batch size">
+    Enter the number of vouchers to generate (e.g., 100).
+  </Step>
+  <Step title="Generate and print">
+    Click **Generate**. FyberPay creates unique voucher codes and provisions RADIUS credentials for each one. Download the batch as a printable PDF (voucher cards) or CSV.
+  </Step>
+</Steps>
+
+<Info>
+  Each voucher code is a unique PPPoE/hotspot username with a pre-set password. When a customer enters the voucher code on the login page, RADIUS authenticates them and applies the package's bandwidth limits.
+</Info>
+
+### Voucher Distribution
+
+Common distribution methods for ISPs:
+
+- **Printed voucher cards**: Download the PDF and cut into individual cards for physical resale
+- **SMS delivery**: Sell via M-Pesa and have FyberPay SMS the voucher code to the buyer's phone
+- **Self-service portal**: Customers purchase packages directly from `yourorg.fyberpay.com/portal/buy` and receive credentials instantly
+
+## Bandwidth Limits Per Package
+
+Each hotspot package enforces bandwidth through the same RADIUS mechanism as PPPoE. When you create a plan in FyberPay:
+
+1. FyberPay writes the `Mikrotik-Rate-Limit` attribute to `radgroupreply`
+2. When the hotspot user authenticates, MikroTik receives the rate-limit from RADIUS
+3. A dynamic simple queue is created on the router for that session
+
+### Example Package Configuration
+
+| Package | Download | Upload | Burst | Price |
+|---|---|---|---|---|
+| Basic Wi-Fi | 5 Mbps | 2 Mbps | None | KES 50/day |
+| Standard Wi-Fi | 10 Mbps | 5 Mbps | 15/8 Mbps for 10s | KES 100/day |
+| Premium Wi-Fi | 25 Mbps | 10 Mbps | 40/15 Mbps for 10s | KES 200/day |
+
+Burst settings give users a temporary speed boost when they first start downloading, improving perceived performance for web browsing.
+
+## Session Timeouts
+
+Configure session limits to control how long a hotspot user stays connected:
+
+### MikroTik Session Limits
+
+On your MikroTik hotspot server profile, configure:
+
+| Setting | Description | Recommended Value |
+|---|---|---|
+| **Session Timeout** | Maximum session duration before forced re-authentication | Match billing cycle (e.g., 24h for daily packages) |
+| **Idle Timeout** | Disconnect after inactivity period | 15-30 minutes |
+| **Keepalive Timeout** | Interval for checking if client is still connected | 30 seconds |
+
+### RADIUS Session Control
+
+FyberPay can also send session timeout attributes via RADIUS:
+
+- `Session-Timeout`: Maximum seconds before disconnect
+- `Idle-Timeout`: Seconds of idle before disconnect
+
+These are set per plan in the `radgroupreply` table alongside the rate-limit attribute.
+
+<Tip>
+  For time-based packages, set the `Session-Timeout` RADIUS attribute to match the package duration. A 1-hour package would have `Session-Timeout = 3600`.
+</Tip>
+
+## Walled Garden Configuration
+
+The walled garden allows unauthenticated hotspot users to access specific websites without logging in. This is essential for:
+
+- The FyberPay payment portal (so users can buy packages before authenticating)
+- M-Pesa payment endpoints (so STK Push works before the user has internet)
+- Your ISP's marketing or info page
+
+### Configuring Walled Garden on MikroTik
+
+<Steps>
+  <Step title="Open hotspot walled garden settings">
+    On your MikroTik router, go to **IP > Hotspot > Walled Garden**.
+  </Step>
+  <Step title="Add allowed destinations">
+    Add entries for each domain or IP that should be accessible without authentication:
+
+    ```
+    /ip hotspot walled-garden ip
+    add dst-host=yourorg.fyberpay.com action=accept
+    add dst-host=*.safaricom.co.ke action=accept
+    add dst-host=api.safaricom.co.ke action=accept
+    ```
+  </Step>
+  <Step title="Add DNS access">
+    Ensure DNS resolution works for unauthenticated clients:
+
+    ```
+    /ip hotspot walled-garden ip
+    add dst-port=53 protocol=udp action=accept
+    add dst-port=53 protocol=tcp action=accept
+    ```
+  </Step>
+  <Step title="Test access">
+    Connect a device to the hotspot without authenticating. Verify that you can reach the FyberPay portal and complete an M-Pesa payment. All other sites should redirect to the login page.
+  </Step>
+</Steps>
+
+<Warning>
+  If the walled garden is not configured correctly, subscribers in the dunning walled-garden state or new customers trying to purchase packages will not be able to reach the payment portal. Always test this after router configuration changes.
+</Warning>
+
+### Required Walled Garden Entries
+
+At minimum, your walled garden should allow access to:
+
+| Destination | Reason |
+|---|---|
+| `yourorg.fyberpay.com` | Subscriber portal and payment page |
+| `api.fyberpay.com` | API for STK Push and payment processing |
+| `*.safaricom.co.ke` | M-Pesa API endpoints |
+| DNS (port 53 UDP/TCP) | Domain name resolution |
+
+## Hotspot with FyberPay Billing
+
+The full hotspot billing flow ties together the captive portal, RADIUS, and M-Pesa:
+
+1. **Customer connects** to the Wi-Fi network
+2. **Captive portal** redirects to the login page
+3. **Customer buys a package** via M-Pesa on the walled-garden payment portal
+4. **FyberPay receives payment**, creates a subscription, and provisions RADIUS credentials
+5. **Credentials are sent** to the customer via SMS
+6. **Customer logs in** on the captive portal
+7. **RADIUS authenticates** and returns bandwidth limits to MikroTik
+8. **Customer gets internet** at the package speed for the package duration
+
+<Info>
+  FyberPay charges a **2% commission** on hotspot transactions. This is calculated on the payment amount and deducted from your settlement. Commission details are visible at **Billing > Platform Fees**.
+</Info>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Network Provisioning" icon="network-wired" href="/guides/network-provisioning">
+    Deep dive into RADIUS, PPPoE profiles, and bandwidth shaping.
+  </Card>
+  <Card title="Dunning Automation" icon="bell" href="/guides/dunning-automation">
+    Automate payment collection for overdue hotspot and PPPoE subscribers.
+  </Card>
+</CardGroup>

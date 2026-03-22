@@ -1,0 +1,56 @@
+---
+title: Introduction
+description: FyberPay is the all-in-one billing, payments, and network management platform built for East African ISPs.
+---
+
+## What is FyberPay?
+
+FyberPay automates the operational backbone of internet service providers. From subscriber onboarding to M-Pesa collection, RADIUS authentication, and CPE provisioning, FyberPay handles the infrastructure so you can focus on growing your network.
+
+## Who is FyberPay for?
+
+FyberPay serves ISPs of all sizes across East Africa:
+
+- **Startup ISPs** launching their first estate or building network
+- **Growing ISPs** scaling from tens to thousands of subscribers
+- **Established ISPs** migrating from spreadsheets or legacy billing tools
+
+## Core Capabilities
+
+<CardGroup cols={2}>
+  <Card title="Automated Billing" icon="file-invoice-dollar">
+    Recurring invoices, prorated charges, plan changes, and automated dunning with configurable grace periods.
+  </Card>
+  <Card title="M-Pesa Integration" icon="mobile-screen">
+    STK Push collection, C2B validation, Bill Manager enrollment, and real-time payment reconciliation via Daraja API.
+  </Card>
+  <Card title="Network Management" icon="network-wired">
+    RADIUS authentication (PPPoE + Hotspot), bandwidth shaping, MikroTik RouterOS sync, and CPE auto-configuration via GenieACS.
+  </Card>
+  <Card title="Subscriber Portal" icon="user">
+    White-labeled PWA for subscribers to view usage, pay invoices, manage their account, and get support.
+  </Card>
+</CardGroup>
+
+## Architecture Overview
+
+FyberPay is a multi-tenant SaaS platform with subdomain-based isolation:
+
+- **`yourorg.fyberpay.com`** - Your branded admin dashboard
+- **`yourorg.fyberpay.com/portal`** - Subscriber self-service portal
+- **`fyberpay.com`** - Platform administration (super admins)
+
+Each ISP gets isolated data, custom branding, and independent configuration while sharing the underlying infrastructure.
+
+## Pricing
+
+| Component | Cost |
+|-----------|------|
+| Platform fee | KES 500/month |
+| Per subscriber | KES 20/subscriber/month |
+| Hotspot commission | 2% of hotspot revenue |
+| Free trial | 14 days, full access |
+
+<Card title="Ready to get started?" icon="rocket" href="/getting-started/quickstart">
+  Set up your ISP on FyberPay in under 15 minutes.
+</Card>

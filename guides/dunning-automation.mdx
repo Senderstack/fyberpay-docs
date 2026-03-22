@@ -1,0 +1,239 @@
+---
+title: Dunning Automation
+description: Configure automated payment retries, walled garden, and suspension for overdue accounts.
+---
+
+## Overview
+
+Dunning is the process of automatically collecting overdue payments from subscribers. FyberPay's dunning pipeline handles this end-to-end: sending payment reminders, retrying M-Pesa STK Push, restricting service via walled garden, and ultimately suspending accounts that remain unpaid.
+
+The entire pipeline is automated and configurable per organization. Once set up, it runs continuously without manual intervention.
+
+## Dunning State Machine
+
+Every subscription has a `dunningState` that tracks where it is in the collection pipeline. The state machine enforces valid transitions, preventing invalid jumps.
+
+### States
+
+| State | Description | Subscriber Experience |
+|---|---|---|
+| **none** | No dunning active. Subscription is current. | Full internet access |
+| **retrying** | Payment is overdue. FyberPay is sending STK Push retries. | Full internet access (grace period) |
+| **walled_garden** | Extended non-payment. Service restricted to payment portal only. | Can only access FyberPay portal and M-Pesa |
+| **suspended** | Final escalation. Service fully disconnected. | No internet access |
+
+### State Transition Diagram
+
+```
+                    payment received
+          +--------------------------------+
+          |                                |
+          v          (no payment)          |
+        none -----> retrying -----> walled_garden -----> suspended
+          ^             |                |                    |
+          |             |                |                    |
+          +-------------+----------------+--------------------+
+                        payment received at any stage
+                        resets dunning back to "none"
+```
+
+### Valid Transitions
+
+| From | To | Trigger |
+|---|---|---|
+| none | retrying | Subscription expires without payment |
+| retrying | walled_garden | Configurable days pass without payment |
+| retrying | none | Payment received |
+| walled_garden | suspended | Configurable days pass without payment |
+| walled_garden | none | Payment received |
+| suspended | none | Payment received or manual reactivation |
+
+<Info>
+  Payment at any dunning stage resets the state to `none`, restores the subscriber's RADIUS group, extends the subscription, and sends a confirmation notification. This happens automatically with zero manual intervention.
+</Info>
+
+## Configuration
+
+Navigate to **Settings > Dunning** to configure the dunning pipeline for your organization.
+
+### Retry Intervals
+
+The `retryIntervals` setting controls when FyberPay sends automatic STK Push payment retries after a subscription expires.
+
+**Default**: `[1, 3, 7]` (retry on day 1, day 3, and day 7 after expiry)
+
+Each retry sends an M-Pesa STK Push to the subscriber's phone number, prompting them to pay the outstanding invoice.
+
+<Tabs>
+  <Tab title="Aggressive collection">
+    For ISPs that want faster payment collection:
+    ```
+    retryIntervals: [1, 2, 3, 5]
+    walledGardenAfterDays: 3
+    suspendAfterDays: 7
+    ```
+    Retries on days 1, 2, 3, and 5. Walled garden after 3 days. Full suspension after 7 days.
+  </Tab>
+  <Tab title="Default (balanced)">
+    The default configuration balances collection pressure with subscriber goodwill:
+    ```
+    retryIntervals: [1, 3, 7]
+    walledGardenAfterDays: 7
+    suspendAfterDays: 14
+    ```
+    Retries on days 1, 3, and 7. Walled garden after 7 days. Full suspension after 14 days.
+  </Tab>
+  <Tab title="Lenient">
+    For ISPs that prefer a softer approach:
+    ```
+    retryIntervals: [3, 7, 14]
+    walledGardenAfterDays: 14
+    suspendAfterDays: 30
+    ```
+    Retries on days 3, 7, and 14. Walled garden after 14 days. Full suspension after 30 days.
+  </Tab>
+</Tabs>
+
+### Walled Garden Threshold
+
+The `walledGardenAfterDays` setting controls when a subscriber's service is restricted to the payment portal only.
+
+**Default**: 7 days after expiry
+
+When a subscriber enters the walled garden:
+1. Their RADIUS group is changed to `walled-garden`
+2. They can only access the FyberPay payment portal and M-Pesa endpoints
+3. All other internet traffic is blocked
+4. They receive an SMS and email notification explaining the restriction
+5. STK Push retries continue during the walled garden period
+
+### Suspension Threshold
+
+The `suspendAfterDays` setting controls when a subscriber is fully disconnected.
+
+**Default**: 14 days after expiry
+
+When suspended:
+1. The subscription status changes to `suspended`
+2. RADIUS credentials remain in the walled-garden group (effectively no access)
+3. The subscriber receives a final SMS and email notification
+4. No further automatic retries are attempted
+5. Service is restored immediately if payment is received
+
+## Timeline Example
+
+Here is a concrete example of the dunning pipeline with default settings for a subscriber whose subscription expired on March 1st.
+
+| Date | Day | Event | Subscriber Impact |
+|---|---|---|---|
+| Mar 1 | 0 | Subscription expires | Full access (grace period) |
+| Mar 2 | 1 | STK Push retry #1 sent | Full access |
+| Mar 4 | 3 | STK Push retry #2 sent | Full access |
+| Mar 8 | 7 | STK Push retry #3 + **walled garden activated** | Restricted to payment portal |
+| Mar 8 | 7 | SMS + email: "Your internet has been restricted" | Portal-only access |
+| Mar 15 | 14 | **Subscription suspended** | No internet access |
+| Mar 15 | 14 | SMS + email: "Your service has been suspended" | No access |
+
+<Warning>
+  The dunning pipeline only processes subscriptions with `autoRenew` set to `true`. If a subscriber has auto-renew disabled, their subscription simply expires without dunning retries.
+</Warning>
+
+## Notification Templates
+
+FyberPay sends automated notifications at each dunning stage via SMS and email.
+
+### Walled Garden Notification
+
+Sent when the subscriber is moved to the walled garden:
+
+- **SMS**: "Hi {name}, your {planName} subscription is overdue. Your internet has been restricted. Pay {amount} to restore full access."
+- **Email**: Includes payment link and M-Pesa instructions
+
+### Suspension Notification
+
+Sent when the subscriber is fully suspended:
+
+- **SMS**: "Hi {name}, your {planName} subscription has been suspended due to non-payment. Pay {amount} to reactivate your service."
+- **Email**: Includes payment link and support contact
+
+<Tip>
+  You can enable or disable SMS and email notifications independently at **Settings > Notifications**. For example, you might disable email notifications if most of your subscribers do not have email addresses.
+</Tip>
+
+## Auto-Reactivation on Payment
+
+When FyberPay receives a payment for a subscriber in any dunning state, the following happens automatically:
+
+<Steps>
+  <Step title="Payment matched">
+    The M-Pesa payment is matched to the subscriber's outstanding invoice (via STK Push callback, C2B reference, or Bill Manager).
+  </Step>
+  <Step title="Invoice marked paid">
+    The invoice status transitions to `paid` with the M-Pesa receipt number recorded.
+  </Step>
+  <Step title="Subscription extended">
+    The subscription's expiry date is extended by the plan's billing cycle days from the current date.
+  </Step>
+  <Step title="Dunning state reset">
+    The dunning state is reset from whatever it was (retrying, walled_garden, or suspended) back to `none`.
+  </Step>
+  <Step title="RADIUS restored">
+    The subscriber's RADIUS group is changed from `walled-garden` back to their plan's group. Bandwidth limits are restored.
+  </Step>
+  <Step title="Confirmation sent">
+    The subscriber receives a payment confirmation via SMS and email, confirming their service has been restored.
+  </Step>
+</Steps>
+
+<Info>
+  The entire reactivation process happens within seconds of the payment being confirmed. Subscribers who pay via STK Push typically see their internet restored before the M-Pesa confirmation SMS arrives.
+</Info>
+
+## How the Pipeline Runs
+
+The dunning processor runs as a scheduled background job (BullMQ). It periodically scans for overdue subscriptions and processes each one based on its current dunning state and the number of days since expiry.
+
+### Processing Logic
+
+For each overdue subscription, the processor:
+
+1. Reads the current `dunningState` and calculates `daysSinceExpiry`
+2. If in `none` or `retrying` state and `daysSinceExpiry >= walledGardenAfterDays`, escalates to walled garden
+3. If in `none` or `retrying` state and below the threshold, sends an STK Push retry
+4. If in `walled_garden` state and `daysSinceExpiry >= suspendAfterDays`, escalates to suspended
+5. If in `walled_garden` state and below the threshold, sends an STK Push retry
+6. If in `suspended` state, takes no further action
+
+### Idempotency
+
+The dunning processor is idempotent. Running it multiple times for the same subscription at the same time produces the same result. State transitions are validated by the state machine, and duplicate STK Push requests are handled by FyberPay's idempotency layer.
+
+## Monitoring Dunning
+
+Track dunning activity from the admin dashboard:
+
+- **Dashboard > Overview**: Shows count of subscribers in each dunning state
+- **Subscribers** list: Filter by dunning state (retrying, walled_garden, suspended)
+- **Billing > Invoices**: Filter overdue invoices to see which subscriptions are in the pipeline
+
+## Manual Overrides
+
+Admins can override the dunning pipeline at any time:
+
+| Action | How | Effect |
+|---|---|---|
+| **Skip dunning** | Manually extend a subscription | Sets new expiry date, resets dunning to `none` |
+| **Force suspend** | Suspend from the subscriber page | Immediately suspends regardless of dunning state |
+| **Force reactivate** | Reactivate from the subscriber page | Resets dunning, restores RADIUS, requires payment or admin override |
+| **Void invoice** | Void the overdue invoice | Removes the payment obligation; subscriber stays in current state until manually adjusted |
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="M-Pesa Integration" icon="mobile-screen" href="/guides/mpesa-integration">
+    Configure the payment channels that power dunning retries.
+  </Card>
+  <Card title="Billing Setup" icon="file-invoice-dollar" href="/guides/billing-setup">
+    Set up invoicing, tax, and payment terms.
+  </Card>
+</CardGroup>

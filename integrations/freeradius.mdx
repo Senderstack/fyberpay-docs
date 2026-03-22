@@ -1,0 +1,323 @@
+---
+title: "FreeRADIUS"
+description: "How FyberPay provisions RADIUS attributes, manages subscriber authentication, enforces bandwidth plans, and handles CoA/disconnect."
+---
+
+FyberPay uses FreeRADIUS as the central authentication and authorization server for PPPoE subscribers. The RADIUS database is managed entirely by FyberPay through the transactional outbox pattern: when a subscription is activated, upgraded, suspended, or cancelled, an event triggers the corresponding RADIUS provisioning.
+
+## Architecture
+
+```
+Subscriber CPE                  MikroTik NAS               FyberPay
++-----------+                  +-------------+            +------------------+
+|           |--- PPPoE ------->| RADIUS      |--- Auth -->| FreeRADIUS       |
+|           |                  | Client      |--- Acct -->| (SQL backend)    |
++-----------+                  +-------------+            +------------------+
+                                     ^                    | radcheck         |
+                                     |                    | radreply         |
+                                CoA / Disconnect          | radusergroup     |
+                                (UDP port 3799)           | radgroupreply    |
+                                     |                    | radacct          |
+                               +------------------+      | nas              |
+                               | CoA Service      |------+------------------+
+                               | (RFC 5176)       |      | FyberPay API     |
+                               +------------------+      +------------------+
+```
+
+## RADIUS Database Tables
+
+FyberPay writes to five FreeRADIUS SQL tables:
+
+| Table | Purpose | Managed By |
+|-------|---------|------------|
+| `radcheck` | Per-user authentication attributes (passwords) | RadiusService |
+| `radreply` | Per-user reply attributes (static IPs) | RadiusService |
+| `radusergroup` | Maps users to plan groups | RadiusService |
+| `radgroupreply` | Per-group reply attributes (speed limits) | RadiusService |
+| `radacct` | Accounting records (read-only from FyberPay) | FreeRADIUS |
+| `nas` | NAS device registration | NetworkService |
+
+## Authentication Methods
+
+FyberPay provisions credentials that support all three common PPPoE authentication methods:
+
+<AccordionGroup>
+  <Accordion title="PAP (Password Authentication Protocol)">
+    Stored as `Cleartext-Password` in `radcheck`:
+
+    ```sql
+    INSERT INTO radcheck (username, attribute, op, value)
+    VALUES ('john.doe', 'Cleartext-Password', ':=', 'subscriber_password');
+    ```
+
+    PAP transmits passwords in cleartext, relying on the PPPoE session encryption. Suitable for most ISP deployments.
+  </Accordion>
+
+  <Accordion title="CHAP (Challenge Handshake Authentication Protocol)">
+    Uses the same `Cleartext-Password` attribute. FreeRADIUS computes the CHAP response server-side using the stored cleartext password.
+  </Accordion>
+
+  <Accordion title="MS-CHAPv2 (Microsoft CHAP version 2)">
+    Stored as `NT-Password` in `radcheck`:
+
+    ```sql
+    INSERT INTO radcheck (username, attribute, op, value)
+    VALUES ('john.doe', 'NT-Password', ':=', 'md4_hex_hash');
+    ```
+
+    FyberPay computes the NT-Password as `MD4(UTF-16LE(password))`. Since OpenSSL 3.x disables MD4 by default, FyberPay includes a pure JavaScript MD4 implementation as a fallback.
+
+    <Info>
+    Both `Cleartext-Password` and `NT-Password` are provisioned for every subscriber, so all three authentication methods work without any additional configuration.
+    </Info>
+  </Accordion>
+</AccordionGroup>
+
+## Subscriber Provisioning Lifecycle
+
+FyberPay provisions RADIUS attributes automatically via the outbox event system. No manual SQL manipulation is needed.
+
+<Steps>
+  <Step title="Subscription activated">
+    Event: `subscription.activated`
+
+    FyberPay writes to three tables:
+
+    1. **radcheck**: Sets `Cleartext-Password` and `NT-Password` for the subscriber's PPPoE username
+    2. **radusergroup**: Maps the subscriber to their plan's RADIUS group name
+    3. **radreply** (optional): Sets `Framed-IP-Address` if the subscriber has a static IP assignment
+
+    ```
+    radcheck:     john.doe -> Cleartext-Password := "p@ssw0rd"
+    radcheck:     john.doe -> NT-Password := "a4f49c406510..."
+    radusergroup: john.doe -> plan-10mbps (priority: 1)
+    radreply:     john.doe -> Framed-IP-Address := "10.0.1.50"  (if static)
+    ```
+  </Step>
+
+  <Step title="Plan upgrade/downgrade">
+    Event: `subscription.upgraded`
+
+    FyberPay removes the old group mapping and creates a new one:
+
+    ```
+    radusergroup: john.doe -> plan-10mbps  (deleted)
+    radusergroup: john.doe -> plan-25mbps  (created)
+    ```
+
+    A CoA (Change of Authorization) request is then sent to the NAS to apply the new speed in real time without disconnecting the subscriber.
+  </Step>
+
+  <Step title="Subscription suspended or expired">
+    Events: `subscription.suspended`, `subscription.expired`, `dunning.walled_garden`
+
+    FyberPay moves the subscriber to the `walled-garden` group:
+
+    ```
+    radusergroup: john.doe -> plan-10mbps     (deleted)
+    radusergroup: john.doe -> walled-garden   (created)
+    ```
+
+    The walled garden group has restrictive attributes that limit the subscriber to a captive portal or payment page only.
+  </Step>
+
+  <Step title="Subscription cancelled">
+    Event: `subscription.cancelled`
+
+    FyberPay removes all RADIUS records for the subscriber:
+
+    ```
+    radcheck:     john.doe  (all entries deleted)
+    radusergroup: john.doe  (all entries deleted)
+    radreply:     john.doe  (all entries deleted)
+    ```
+
+    The subscriber can no longer authenticate.
+  </Step>
+</Steps>
+
+## Authorization Attributes
+
+### Group Reply Attributes (radgroupreply)
+
+When a plan is created or modified in FyberPay, the corresponding RADIUS group attributes are synced:
+
+| Attribute | Operator | Example Value | Purpose |
+|-----------|----------|---------------|---------|
+| `Mikrotik-Rate-Limit` | `:=` | `10M/10M` | Download/upload speed limit |
+| `Mikrotik-Rate-Limit` | `:=` | `10M/10M 15M/15M 8M/8M 10` | With burst (limit/burst/threshold/time) |
+
+The rate limit string format follows MikroTik conventions:
+
+```
+rx-rate/tx-rate [burst-rx/burst-tx burst-threshold-rx/burst-threshold-tx burst-time]
+```
+
+Example for a 10Mbps plan with 15Mbps burst:
+```
+10M/10M 15M/15M 8M/8M 10
+```
+
+### Per-User Reply Attributes (radreply)
+
+| Attribute | Operator | Example Value | Purpose |
+|-----------|----------|---------------|---------|
+| `Framed-IP-Address` | `:=` | `10.0.1.50` | Static IP assignment |
+
+<Tip>
+Static IPs are optional and configured per-subscriber in FyberPay's admin dashboard. When set, FreeRADIUS returns the `Framed-IP-Address` in the Access-Accept, and the NAS assigns that IP to the subscriber's PPPoE session.
+</Tip>
+
+## Accounting Flow
+
+FreeRADIUS receives accounting packets from NAS devices and writes them to the `radacct` table. FyberPay reads this data for reporting and monitoring.
+
+### Accounting Packet Types
+
+| Type | When Sent | Data Captured |
+|------|-----------|---------------|
+| **Accounting-Start** | Session begins | Username, NAS IP, session ID, start time |
+| **Interim-Update** | Every 5 minutes | Cumulative input/output octets, session time |
+| **Accounting-Stop** | Session ends | Final byte counts, termination cause, total session time |
+
+### Session Monitoring
+
+FyberPay queries active sessions (where `acctstoptime IS NULL`) to show:
+- Currently connected subscribers
+- Session duration
+- Real-time bandwidth usage
+
+### Bandwidth Usage Reporting
+
+FyberPay aggregates `acctinputoctets` (upload) and `acctoutputoctets` (download) from `radacct` for usage reports:
+
+```sql
+SELECT
+  SUM(acctinputoctets) as upload_bytes,
+  SUM(acctoutputoctets) as download_bytes
+FROM radacct
+WHERE username = 'john.doe'
+  AND acctstarttime BETWEEN '2026-03-01' AND '2026-03-31';
+```
+
+## CoA (Change of Authorization)
+
+FyberPay sends CoA packets (RFC 5176) to apply changes to active sessions without disconnecting the subscriber.
+
+### How CoA Works
+
+1. FyberPay updates the RADIUS database (e.g., new speed group)
+2. FyberPay sends a CoA-Request packet via UDP to the NAS device's CoA port (default: 3799)
+3. The NAS re-authorizes the subscriber and applies the new attributes
+4. The NAS responds with CoA-ACK (success) or CoA-NAK (failure)
+
+### CoA Packet Format
+
+FyberPay builds CoA packets according to RFC 2865/RFC 5176:
+
+```
+Code (1 byte) + Identifier (1 byte) + Length (2 bytes)
++ Request Authenticator (16 bytes) + Attributes (variable)
+```
+
+The Request Authenticator is calculated as:
+```
+MD5(Code + Identifier + Length + 16_zero_bytes + Attributes + Secret)
+```
+
+### Retry Behavior
+
+- Timeout: 2 seconds per attempt
+- Maximum retries: 3
+- Transport: UDP (connectionless)
+
+If all retries are exhausted, FyberPay logs a warning. The subscriber's RADIUS attributes are still updated in the database, so the change will take effect on the next re-authentication (e.g., PPPoE reconnect).
+
+## Disconnect Messages (Packet of Disconnect)
+
+FyberPay sends Disconnect-Request packets to force-disconnect a subscriber. Used for:
+
+- **Subscription suspension**: subscriber is moved to walled garden and their active session is terminated
+- **Account termination**: subscriber's session is killed after RADIUS credentials are removed
+- **Manual disconnect**: admin triggers a disconnect from the dashboard
+
+### Disconnect Flow
+
+```
+FyberPay                           MikroTik NAS
+    |                                    |
+    |--- Disconnect-Request (UDP) ------>|
+    |    (User-Name = "john.doe")        |
+    |                                    |
+    |<-- Disconnect-ACK -----------------|  (success)
+    |  or                                |
+    |<-- Disconnect-NAK -----------------|  (rejected)
+```
+
+The Disconnect-Request contains the `User-Name` attribute identifying which subscriber session to terminate.
+
+## NAS Device Registration
+
+When an ISP adds a NAS device in FyberPay, it is automatically registered in the FreeRADIUS `nas` table:
+
+```sql
+INSERT INTO nas (nasname, secret, shortname, type)
+VALUES ('10.0.0.1', 'shared_radius_secret', 'Westlands-POP-1', 'mikrotik');
+```
+
+This tells FreeRADIUS to accept RADIUS packets from that NAS IP using the specified shared secret.
+
+## Walled Garden
+
+The `walled-garden` RADIUS group is a special group used for suspended, expired, or dunned subscribers. ISPs configure the walled garden attributes to restrict access to only the payment portal.
+
+Typical walled garden configuration on the MikroTik NAS:
+- Restricted speed (e.g., 512k/512k)
+- Address list assignment for firewall-based captive portal
+- DNS redirection to the payment page
+
+## FreeRADIUS Configuration
+
+FyberPay's FreeRADIUS instance runs in a Docker container and is configured to use SQL as its backend. Key configuration points:
+
+| Config | Value | Purpose |
+|--------|-------|---------|
+| Auth port | 1812 | Standard RADIUS authentication |
+| Acct port | 1813 | Standard RADIUS accounting |
+| SQL driver | PostgreSQL | Backend for all RADIUS tables |
+| Dictionary | MikroTik vendor attributes loaded | Supports `Mikrotik-Rate-Limit` and other vendor-specific attributes |
+
+<Warning>
+The RADIUS database (`RADIUS_DB_URL`) is a separate PostgreSQL database from FyberPay's main application database. Do not point them at the same database.
+</Warning>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Subscriber cannot authenticate">
+    1. Verify the subscriber exists in `radcheck`: check for both `Cleartext-Password` and `NT-Password` entries
+    2. Confirm the subscriber has a group mapping in `radusergroup`
+    3. Check that the NAS device IP is registered in the `nas` table with the correct shared secret
+    4. Review FreeRADIUS logs: `docker logs freeradius`
+  </Accordion>
+
+  <Accordion title="Speed limits not applying">
+    1. Verify the plan's RADIUS group has a `Mikrotik-Rate-Limit` entry in `radgroupreply`
+    2. Confirm the subscriber's `radusergroup` maps to the correct group name
+    3. Check that the MikroTik dictionary is loaded in FreeRADIUS (vendor attribute 14988)
+    4. Try disconnecting and reconnecting the subscriber to force re-authorization
+  </Accordion>
+
+  <Accordion title="CoA requests timing out">
+    1. Verify the NAS device has `/radius incoming set accept=yes port=3799` configured
+    2. Check that the CoA secret matches between FyberPay and the NAS device
+    3. Ensure the firewall on the NAS allows UDP traffic on port 3799 from FyberPay
+    4. Check network connectivity between FyberPay and the NAS (ping the tunnel IP)
+  </Accordion>
+
+  <Accordion title="Accounting data missing">
+    1. Confirm the NAS has accounting enabled: `/ppp aaa set accounting=yes interim-update=5m`
+    2. Verify FreeRADIUS is receiving accounting packets: check `radacct` table for recent entries
+    3. Check the RADIUS shared secret matches between the NAS and the `nas` table
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,365 @@
+---
+title: "M-Pesa Daraja API"
+description: "Integrate Safaricom M-Pesa payments via STK Push, C2B paybill, and Bill Manager for automated ISP subscriber billing."
+---
+
+FyberPay integrates with Safaricom's Daraja API to process M-Pesa payments for ISP subscriber billing. The platform supports three payment flows: **STK Push** (Lipa Na M-Pesa Online) for instant payment prompts, **C2B** (Customer to Business) for paybill payments, and **Bill Manager** for automated invoice delivery and recurring billing.
+
+## Supported Payment Flows
+
+| Flow | Use Case | Trigger |
+|------|----------|---------|
+| STK Push | On-demand payment prompts | Subscriber clicks "Pay Now" in portal |
+| C2B (Paybill) | Subscriber-initiated paybill payments | Subscriber pays via M-Pesa menu |
+| Bill Manager | Automated invoices with SMS reminders | Invoice created by billing cycle |
+
+## Environment Endpoints
+
+<Tabs>
+  <Tab title="Sandbox">
+    Base URL: `https://sandbox.safaricom.co.ke`
+
+    | Endpoint | Path |
+    |----------|------|
+    | OAuth Token | `/oauth/v1/generate` |
+    | STK Push | `/mpesa/stkpush/v1/processrequest` |
+    | STK Query | `/mpesa/stkpushquery/v1/query` |
+    | C2B Register | `/mpesa/c2b/v2/registerurl` |
+    | Transaction Status | `/mpesa/transactionstatus/v1/query` |
+    | Bill Manager | `/v1/billmanager-invoice/...` |
+  </Tab>
+  <Tab title="Production">
+    Base URL: `https://api.safaricom.co.ke`
+
+    | Endpoint | Path |
+    |----------|------|
+    | OAuth Token | `/oauth/v1/generate` |
+    | STK Push | `/mpesa/stkpush/v1/processrequest` |
+    | STK Query | `/mpesa/stkpushquery/v1/query` |
+    | C2B Register | `/mpesa/c2b/v2/registerurl` |
+    | Transaction Status | `/mpesa/transactionstatus/v1/query` |
+    | Bill Manager | `/v1/billmanager-invoice/v1/billmanager-invoice/...` |
+
+    <Warning>
+    The Bill Manager production URLs use a doubled path prefix: `/v1/billmanager-invoice/v1/billmanager-invoice/...`. This is not a typo. It is how Safaricom's production API is structured. Sandbox uses the single prefix.
+    </Warning>
+  </Tab>
+</Tabs>
+
+## Authentication: OAuth Token Flow
+
+All Daraja API calls require a Bearer token obtained via OAuth 2.0 client credentials.
+
+<Steps>
+  <Step title="Obtain credentials from Daraja portal">
+    Register your app at [developer.safaricom.co.ke](https://developer.safaricom.co.ke) and get your **Consumer Key** and **Consumer Secret**.
+  </Step>
+
+  <Step title="Request an access token">
+    FyberPay sends a GET request with Basic auth (base64-encoded `ConsumerKey:ConsumerSecret`):
+
+    <CodeGroup>
+    ```bash cURL
+    curl -X GET \
+      "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials" \
+      -H "Authorization: Basic $(echo -n 'ConsumerKey:ConsumerSecret' | base64)"
+    ```
+
+    ```json Response
+    {
+      "access_token": "cFJMbGpBNmVyS3dYMH...",
+      "expires_in": "3599"
+    }
+    ```
+    </CodeGroup>
+  </Step>
+
+  <Step title="Token caching">
+    FyberPay caches tokens in Redis for 290 seconds (~5 minutes). Tokens from Safaricom are valid for 3600 seconds (1 hour), but FyberPay refreshes early to avoid edge cases with clock drift. Each set of credentials (per-org or platform-level) gets its own cache key.
+  </Step>
+</Steps>
+
+## STK Push (Lipa Na M-Pesa Online)
+
+STK Push sends a payment prompt directly to the subscriber's phone. The subscriber enters their M-Pesa PIN to authorize the payment.
+
+### Request Format
+
+```json
+{
+  "BusinessShortCode": "174379",
+  "Password": "base64(Shortcode + Passkey + Timestamp)",
+  "Timestamp": "20260322143000",
+  "TransactionType": "CustomerPayBillOnline",
+  "Amount": 1500,
+  "PartyA": "254712345678",
+  "PartyB": "174379",
+  "PhoneNumber": "254712345678",
+  "CallBackURL": "https://api.fyberpay.com/webhooks/mpesa/stk",
+  "AccountReference": "INV-2026-0042",
+  "TransactionDesc": "Payment INV-2026-0042"
+}
+```
+
+<Info>
+The **Password** field is computed as `Base64(BusinessShortCode + Passkey + Timestamp)`. The Timestamp format is `YYYYMMDDHHmmss` in East Africa Time (UTC+3). FyberPay computes this automatically.
+</Info>
+
+<Info>
+M-Pesa requires whole number amounts. FyberPay applies `Math.ceil()` to round up fractional amounts before sending.
+</Info>
+
+### Phone Number Normalization
+
+FyberPay normalizes Kenyan phone numbers to the `254XXXXXXXXX` format (no plus sign). The following inputs are all accepted:
+
+| Input | Normalized |
+|-------|-----------|
+| `+254712345678` | `254712345678` |
+| `0712345678` | `254712345678` |
+| `254712345678` | `254712345678` |
+
+### STK Push Response
+
+```json
+{
+  "MerchantRequestID": "29115-34620561-1",
+  "CheckoutRequestID": "ws_CO_191220191020363925",
+  "ResponseCode": "0",
+  "ResponseDescription": "Success. Request accepted for processing",
+  "CustomerMessage": "Success. Request accepted for processing"
+}
+```
+
+FyberPay stores the `CheckoutRequestID` to correlate with the callback.
+
+### STK Push Callback
+
+Safaricom sends the result to your `CallBackURL`:
+
+<Tabs>
+  <Tab title="Successful Payment">
+    ```json
+    {
+      "Body": {
+        "stkCallback": {
+          "MerchantRequestID": "29115-34620561-1",
+          "CheckoutRequestID": "ws_CO_191220191020363925",
+          "ResultCode": 0,
+          "ResultDesc": "The service request is processed successfully.",
+          "CallbackMetadata": {
+            "Item": [
+              { "Name": "Amount", "Value": 1500 },
+              { "Name": "MpesaReceiptNumber", "Value": "NLJ7RT61SV" },
+              { "Name": "Balance" },
+              { "Name": "TransactionDate", "Value": 20191219102115 },
+              { "Name": "PhoneNumber", "Value": 254712345678 }
+            ]
+          }
+        }
+      }
+    }
+    ```
+  </Tab>
+  <Tab title="Failed/Cancelled">
+    ```json
+    {
+      "Body": {
+        "stkCallback": {
+          "MerchantRequestID": "29115-34620561-1",
+          "CheckoutRequestID": "ws_CO_191220191020363925",
+          "ResultCode": 1032,
+          "ResultDesc": "Request cancelled by user"
+        }
+      }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+FyberPay extracts `MpesaReceiptNumber`, `Amount`, and `PhoneNumber` from the `CallbackMetadata.Item` array.
+
+### STK Query (Status Check)
+
+If no callback arrives, FyberPay can poll the transaction status:
+
+```json
+{
+  "BusinessShortCode": "174379",
+  "Password": "base64(Shortcode + Passkey + Timestamp)",
+  "Timestamp": "20260322143500",
+  "CheckoutRequestID": "ws_CO_191220191020363925"
+}
+```
+
+FyberPay maps the `ResultCode` to internal payment statuses:
+
+| ResultCode | FyberPay Status | Meaning |
+|-----------|-----------------|---------|
+| `0` | `SUCCESS` | Payment completed |
+| `1032` | `CANCELLED` | User cancelled the request |
+| `1019` | `PENDING` | Transaction in progress |
+| `1025` | `PENDING` | Transaction timed out, may still complete |
+| `1037` | `PENDING` | Timeout waiting for user input |
+| Other | `FAILED` | Transaction failed |
+
+## C2B (Customer to Business)
+
+C2B handles payments where the subscriber initiates the transaction from their M-Pesa menu by sending money to the ISP's paybill number.
+
+### URL Registration
+
+FyberPay registers validation and confirmation URLs with Safaricom:
+
+```
+POST /mpesa/c2b/v2/registerurl
+```
+
+| URL Type | Endpoint | Purpose |
+|----------|----------|---------|
+| Validation | `/webhooks/mpesa/c2b/validation` | FyberPay validates the payment before Safaricom processes it |
+| Confirmation | `/webhooks/mpesa/c2b/confirmation` | Safaricom confirms the completed payment |
+
+### C2B Callback Payload
+
+```json
+{
+  "TransactionType": "Pay Bill",
+  "TransID": "RKTQDM7W6S",
+  "TransTime": "20260322143025",
+  "TransAmount": "1500.00",
+  "BusinessShortCode": "174379",
+  "BillRefNumber": "INV-2026-0042",
+  "InvoiceNumber": "",
+  "OrgAccountBalance": "49197.00",
+  "ThirdPartyTransID": "",
+  "MSISDN": "254712345678",
+  "FirstName": "JOHN",
+  "MiddleName": "",
+  "LastName": "DOE"
+}
+```
+
+FyberPay parses the `TransID` as the receipt number, `TransAmount` as the payment amount, `MSISDN` as the phone number, and `BillRefNumber` as the account/invoice reference.
+
+## Bill Manager API
+
+Bill Manager handles automated invoice delivery, SMS reminders, and payment reconciliation. It operates at the **platform level** (not per-org) using dedicated credentials.
+
+### One-Time Setup: Opt-In
+
+Register your paybill with Safaricom Bill Manager:
+
+```json
+{
+  "shortcode": "174379",
+  "email": "billing@fyberpay.com",
+  "officialContact": "254700000000",
+  "sendReminders": 1,
+  "callbackurl": "https://api.fyberpay.com/webhooks/billmanager/payment"
+}
+```
+
+The response includes an `app_key` that confirms successful registration.
+
+### Sending Invoices
+
+<Tabs>
+  <Tab title="Single Invoice">
+    **Endpoint**: `POST /v1/billmanager-invoice/single-invoicing`
+
+    Sends an invoice to a single subscriber. The subscriber receives an SMS with the amount, due date, and payment instructions.
+  </Tab>
+  <Tab title="Bulk Invoices">
+    **Endpoint**: `POST /v1/billmanager-invoice/bulk-invoicing`
+
+    Send up to 1,000 invoices in a single API call. Used during billing cycle processing.
+  </Tab>
+</Tabs>
+
+### Cancelling Invoices
+
+```json
+POST /v1/billmanager-invoice/cancel-single-invoice
+{
+  "externalReference": "INV-2026-0042"
+}
+```
+
+Returns `200` for successful cancellation or `409` if the invoice was already cancelled (both treated as success by FyberPay).
+
+### Payment Reconciliation
+
+After processing a Bill Manager payment, FyberPay sends an acknowledgment back to Safaricom. This triggers an e-receipt SMS to the subscriber:
+
+```
+POST /v1/billmanager-invoice/reconciliation
+```
+
+## Webhook Security
+
+FyberPay validates incoming M-Pesa callbacks using **IP allowlisting**. Configure the `DARAJA_ALLOWED_IPS` environment variable with Safaricom's callback IPs (comma-separated). If no allowlist is configured, all IPs are accepted (suitable for sandbox testing only).
+
+<Warning>
+Always configure `DARAJA_ALLOWED_IPS` in production. Safaricom publishes their callback IP ranges in the Daraja developer portal.
+</Warning>
+
+## Error Codes Reference
+
+Common M-Pesa STK Push error codes:
+
+| Code | Description |
+|------|-------------|
+| `0` | Success |
+| `1` | Insufficient funds |
+| `1019` | Transaction in progress |
+| `1025` | Timeout waiting for response |
+| `1032` | Request cancelled by user |
+| `1037` | Timeout waiting for user input |
+| `2001` | Wrong PIN entered |
+| `1001` | Unable to lock subscriber (subscriber busy) |
+| `1` | Balance insufficient |
+| `17` | Internal failure |
+
+## Retry Behavior and Circuit Breaker
+
+All Daraja API calls are wrapped in a circuit breaker (`daraja` circuit). If Safaricom's API is consistently failing, the circuit opens and FyberPay stops sending requests for a cooldown period. This prevents cascade failures and protects against Safaricom downtime.
+
+For STK callbacks that fail to arrive:
+1. FyberPay queries the transaction status using the STK Query endpoint
+2. If the query also fails, the payment remains in `PENDING` status
+3. A background job retries pending payment status checks periodically
+
+## Per-Org vs Platform Credentials
+
+FyberPay supports two credential models:
+
+| Model | Use Case | Configuration |
+|-------|----------|--------------|
+| **Platform credentials** | Single paybill for all ISPs | Set via `DARAJA_CONSUMER_KEY`, `DARAJA_CONSUMER_SECRET`, `DARAJA_SHORTCODE` env vars |
+| **Per-org credentials** | Each ISP has their own paybill | Configured in **Settings > Payment Gateways** per organization |
+
+Per-org credentials take priority. If an organization has no M-Pesa credentials configured, FyberPay falls back to platform-level credentials.
+
+## Required Environment Variables
+
+```bash
+# Daraja API credentials (platform-level fallback)
+DARAJA_CONSUMER_KEY=your_consumer_key
+DARAJA_CONSUMER_SECRET=your_consumer_secret
+DARAJA_SHORTCODE=174379
+DARAJA_PASSKEY=your_passkey
+DARAJA_CALLBACK_URL=https://api.fyberpay.com/webhooks/mpesa/stk
+DARAJA_ENV=sandbox  # or "production"
+DARAJA_ALLOWED_IPS=196.201.214.200,196.201.214.206
+
+# Bill Manager credentials (platform-level)
+BILLMGR_CONSUMER_KEY=your_bm_consumer_key
+BILLMGR_CONSUMER_SECRET=your_bm_consumer_secret
+BILLMGR_SHORTCODE=174379
+BILLMGR_EMAIL=billing@yourisp.com
+BILLMGR_PHONE=254700000000
+
+# Gateway mode
+GATEWAY_MODE=live  # or "test" for sandbox
+```

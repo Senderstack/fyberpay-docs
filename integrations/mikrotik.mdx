@@ -1,0 +1,244 @@
+---
+title: "MikroTik RouterOS"
+description: "Connect MikroTik routers to FyberPay for real-time monitoring, PPPoE management, queue control, and automated provisioning."
+---
+
+FyberPay communicates with MikroTik routers via the **RouterOS REST API**, introduced in RouterOS 7.1. For RouterOS 6.x devices, FyberPay uses the legacy API port. Each router connects over an encrypted SSTP management tunnel, so the API is never exposed to the public internet.
+
+## Supported RouterOS Versions
+
+| Version | API Method | Notes |
+|---------|-----------|-------|
+| RouterOS 7.1+ | REST API (HTTP/HTTPS) | Recommended. Full feature support. |
+| RouterOS 6.x | REST API via www service | Requires `/ip service set www` enabled. |
+
+<Info>
+RouterOS 7.x is recommended for all new deployments. FyberPay uses the `/rest/` endpoint prefix for all API calls, which requires the `www` or `www-ssl` service to be enabled on the router.
+</Info>
+
+## Architecture Overview
+
+```
+MikroTik Router                    FyberPay Platform
++------------------+               +------------------+
+| RouterOS REST API|<-- SSTP ----->| RouterOS Service |
+| (port 80/443)    |   Tunnel      | (circuit breaker)|
++------------------+               +------------------+
+| PPPoE Server     |               | Provisioning Svc |
+| RADIUS Client    |               | CoA Service      |
+| Firewall / Queue |               | RADIUS DB        |
++------------------+               +------------------+
+```
+
+FyberPay connects to each router through an SSTP tunnel. The router's REST API listens on the tunnel IP (10.99.x.x subnet), never on a public interface.
+
+## Connection Setup
+
+<Steps>
+  <Step title="Register the NAS device">
+    In the FyberPay admin dashboard, navigate to **Network > NAS Devices** and add a new device. Provide:
+    - **Device name**: a human-readable label (e.g. "Westlands-POP-1")
+    - **IP address**: the router's WAN IP (used for RADIUS NAS registration)
+    - **RADIUS secret**: shared secret for RADIUS authentication
+    - **CoA port**: default is `3799`
+  </Step>
+
+  <Step title="Run the bootstrap script">
+    FyberPay generates a RouterOS provisioning script for each device. Copy and paste it into the router's terminal. The script handles:
+    1. SSTP tunnel creation with a dedicated PPP profile (`fyberpay-tunnel`)
+    2. RADIUS client configuration (authentication port 1812, accounting port 1813)
+    3. REST API user creation with scoped permissions
+    4. Firewall rules to allow tunnel traffic
+
+    <Warning>
+    The SSTP client **must** use the dedicated `fyberpay-tunnel` PPP profile. Using `profile=default` causes IPCP negotiation failures because the default profile may have hardcoded addresses that conflict with the tunnel's dynamic IP assignment.
+    </Warning>
+  </Step>
+
+  <Step title="Configure the REST API user">
+    The bootstrap script creates an API user with a custom group called `fyberpay-api`. This group has the following policies:
+
+    ```
+    read, write, api, rest-api
+    ```
+
+    Policies explicitly denied: `ftp`, `reboot`, `policy`, `test`, `password`, `sniff`, `sensitive`, `romon`.
+
+    The REST API service is restricted to the tunnel subnet:
+
+    ```routeros
+    /ip service set www disabled=no port=80 address=10.99.0.0/16
+    ```
+  </Step>
+
+  <Step title="Verify connectivity">
+    After the tunnel establishes, use the **Ping** button in FyberPay's NAS device detail page. FyberPay calls `GET /rest/system/resource` on the router and reports the response time.
+  </Step>
+</Steps>
+
+## API Port Configuration
+
+| Port | Protocol | Use Case |
+|------|----------|----------|
+| 80   | HTTP     | Default REST API port over SSTP tunnel |
+| 443  | HTTPS    | REST API with TLS (self-signed certs accepted) |
+| 8728 | API      | Legacy MikroTik API protocol (RouterOS 6.x) |
+| 8729 | API-SSL  | Legacy API with TLS |
+
+FyberPay auto-detects the protocol based on the configured port. Ports 443 and 8729 use HTTPS; all others use HTTP. Self-signed certificates are accepted since traffic flows over the encrypted SSTP tunnel.
+
+## What FyberPay Reads from the Router
+
+FyberPay polls the following data from each connected router:
+
+<AccordionGroup>
+  <Accordion title="System Resources">
+    **Endpoint**: `GET /rest/system/resource`
+
+    Retrieves CPU load, memory usage (total/free), uptime, RouterOS version, board name, and architecture. Displayed on the fleet dashboard.
+  </Accordion>
+
+  <Accordion title="Active PPP Sessions">
+    **Endpoint**: `GET /rest/ppp/active`
+
+    Lists all active PPPoE/PPTP/L2TP sessions with username, service type, caller ID, assigned IP, uptime, and encoding. Used for subscriber session monitoring.
+  </Accordion>
+
+  <Accordion title="Network Interfaces">
+    **Endpoint**: `GET /rest/interface`
+
+    Returns all interfaces with name, type, running/disabled status, TX/RX byte counters, packet counts, link-down count, and MTU.
+  </Accordion>
+
+  <Accordion title="DHCP Leases">
+    **Endpoint**: `GET /rest/ip/dhcp-server/lease`
+
+    Lists active DHCP leases with IP address, MAC address, hostname, status, and expiry time.
+  </Accordion>
+
+  <Accordion title="Simple Queues">
+    **Endpoint**: `GET /rest/queue/simple`
+
+    Reads all simple queues with name, target address, max-limit, and burst-limit. Used for bandwidth plan enforcement visibility.
+  </Accordion>
+
+  <Accordion title="PPPoE Servers">
+    **Endpoint**: `GET /rest/interface/pppoe-server/server`
+
+    Lists configured PPPoE server instances with service name, bound interface, and disabled state.
+  </Accordion>
+</AccordionGroup>
+
+## What FyberPay Writes to the Router
+
+<AccordionGroup>
+  <Accordion title="PPPoE Server Setup">
+    FyberPay can auto-detect the best interface for PPPoE (preferring bridges, then the busiest Ethernet port) and create a PPPoE server:
+
+    ```json
+    {
+      "service-name": "FyberPay-PPPoE",
+      "interface": "bridge1",
+      "default-profile": "default",
+      "authentication": "pap,chap,mschap2",
+      "one-session-per-host": "yes",
+      "comment": "FyberPay PPPoE Service"
+    }
+    ```
+
+    Existing FyberPay PPPoE servers are removed before creating new ones (idempotent operation).
+  </Accordion>
+
+  <Accordion title="Simple Queue Updates">
+    **Endpoint**: `PATCH /rest/queue/simple/{id}`
+
+    Modify `max-limit`, `burst-limit`, and `target` on existing queues. Used when an ISP manages bandwidth through queues rather than RADIUS attributes.
+  </Accordion>
+
+  <Accordion title="Firewall Address Lists">
+    **Add entry**: `PUT /rest/ip/firewall/address-list`
+    **Remove entry**: `DELETE /rest/ip/firewall/address-list/{id}`
+
+    Used for walled garden enforcement, IP blocking, and access control. Each entry includes the list name, IP address, and an optional comment.
+  </Accordion>
+
+  <Accordion title="Device Reboot">
+    **Endpoint**: `POST /rest/system/reboot`
+
+    Triggers a remote reboot. Requires `admin` or `super_admin` role. All reboot actions are recorded in the audit log.
+  </Accordion>
+</AccordionGroup>
+
+## Fleet Monitoring
+
+FyberPay polls all configured NAS devices in parallel (batches of 10) to build the fleet status dashboard. Each device reports:
+
+- Reachability (online/offline)
+- Board name and RouterOS version
+- CPU load percentage
+- Memory usage percentage
+- System uptime
+- Active PPP session count
+
+Devices without RouterOS API credentials configured appear as "unreachable" with an explicit error message.
+
+## RADIUS Configuration
+
+The bootstrap script configures each router as a RADIUS client pointing to FyberPay's FreeRADIUS server:
+
+```routeros
+/radius add \
+    service=ppp \
+    address=10.99.0.1 \
+    secret="<shared-secret>" \
+    authentication-port=1812 \
+    accounting-port=1813 \
+    timeout=3s \
+    comment="FyberPay RADIUS"
+
+/ppp aaa set use-radius=yes accounting=yes interim-update=5m
+/radius incoming set accept=yes port=3799
+```
+
+<Tip>
+The `interim-update=5m` setting tells the router to send RADIUS accounting updates every 5 minutes. This is required for accurate bandwidth tracking and session monitoring in FyberPay.
+</Tip>
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Router shows as unreachable">
+    1. Verify the SSTP tunnel is established: check `/interface sstp-client print` on the router
+    2. Confirm the tunnel has an IP in the 10.99.x.x range: `/ip address print where interface=fyberpay-tunnel`
+    3. Ensure the `www` service is enabled and bound to the tunnel subnet: `/ip service print`
+    4. Check that the firewall allows tunnel traffic: `/ip firewall filter print where comment~"FyberPay"`
+  </Accordion>
+
+  <Accordion title="API credentials not configured error">
+    The NAS device record in FyberPay is missing the RouterOS API username or password. Re-run the bootstrap script or manually update the device credentials in **Settings > Network > NAS Devices**.
+  </Accordion>
+
+  <Accordion title="SSTP tunnel keeps disconnecting">
+    - Confirm the tunnel uses `profile=fyberpay-tunnel` (not `profile=default`)
+    - Check that `verify-server-certificate=no` is set (FyberPay uses self-signed certs for the SSTP server)
+    - Verify the router has stable internet connectivity: `/ping 8.8.8.8 count=5`
+    - Review tunnel logs: `/log print where topics~"sstp"`
+  </Accordion>
+
+  <Accordion title="REST API returns 401 Unauthorized">
+    - Verify the `fyberpay-api` user exists: `/user print where name=fyberpay-api`
+    - Check the user group has `api` and `rest-api` policies: `/user group print where name=fyberpay-api`
+    - Confirm the password matches what is stored in FyberPay (re-run bootstrap if unsure)
+  </Accordion>
+
+  <Accordion title="Circuit breaker is open">
+    FyberPay wraps all RouterOS API calls in a circuit breaker. If a router is consistently unreachable (multiple consecutive failures), the circuit breaker opens and stops sending requests for a cooldown period. The device will show as unreachable until the circuit closes and the next health check succeeds.
+  </Accordion>
+</AccordionGroup>
+
+## Security Considerations
+
+- All API traffic flows through the encrypted SSTP tunnel. No RouterOS API ports are exposed on public interfaces.
+- API credentials are encrypted at rest using AES-256 (the platform `ENCRYPTION_KEY`).
+- The `fyberpay-api` user group has minimal permissions: no access to `policy`, `password`, `sensitive`, or `sniff` operations.
+- Every write operation (reboot, queue change, address list modification) is recorded in FyberPay's audit log with the acting user, timestamp, and IP address.
