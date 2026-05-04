@@ -1,0 +1,350 @@
+---
+title: "Bind a service to a MikroTik bridge"
+description: "Group several Ethernet ports into one logical LAN, then point FyberPay at the bridge so any device on any port gets the same PPPoE or Hotspot service."
+---
+
+## What this guide is about
+
+Your MikroTik has several physical Ethernet sockets (`ether1`, `ether2`, ...). By default, each socket is a separate network. If you want **several sockets to act as one network**, so that customers plugged into any of them land on the same PPPoE or Hotspot service, you need a **bridge**.
+
+This guide shows you how to:
+
+1. Create a bridge on your MikroTik.
+2. Pick the bridge as the parent interface when you create a service in FyberPay.
+3. Add or remove ports later without touching FyberPay.
+
+<Info>
+A bridge is the router's way of saying "treat these ports as one big port." Once `ether2`, `ether3`, and `ether4` are members of one bridge, a laptop on `ether2` and a phone on `ether4` are on the same network and can see each other.
+</Info>
+
+## When you should use a bridge
+
+Use a bridge when **any of these is true**:
+
+- A downstream switch is plugged into your MikroTik and you want every customer behind that switch to use the same PPPoE or Hotspot service.
+- You want to add more customer ports later without re-creating the service.
+- An access point is plugged into one ether port and customer rooms are wired to other ether ports, and they should all share one network.
+
+You **don't need** a bridge if:
+
+- Each customer goes to a separate ether port AND you want each port to be on its own subnet (rare).
+- You're using VLANs to separate customers (use VLAN sub-interfaces instead).
+
+## Picture it
+
+Without a bridge, each ether port is its own network:
+
+```
+                          MikroTik
+        +--------------------------------------+
+        | ether1  ether2   ether3   ether4     |
+        | (WAN)   net A    net B    net C      |
+        +--------------------------------------+
+                    |        |        |
+                  cust1    cust2    cust3
+                  (separate networks, separate services needed)
+```
+
+With a bridge grouping `ether2` + `ether3` + `ether4`:
+
+```
+                          MikroTik
+        +--------------------------------------+
+        | ether1  +-- bridge-customer ---+     |
+        | (WAN)   |  ether2  ether3  ether4   |
+        |         +----------------------------+
+        +--------------------------------------+
+                    |        |        |
+                  cust1    cust2    cust3
+                  (ALL ON THE SAME NETWORK)
+                  (one PPPoE/Hotspot service serves them all)
+```
+
+The bridge looks, to FyberPay and to the rest of the router, like a single interface called `bridge-customer`. You point FyberPay at the bridge once and you're done.
+
+## Step-by-step setup
+
+<Steps>
+<Step title="Create the bridge in RouterOS (Winbox or SSH)">
+
+This step happens **on the router**, not in FyberPay. Open Winbox or SSH into your MikroTik and run:
+
+```routeros
+/interface/bridge add name=bridge-customer comment="Customer LAN"
+/interface/bridge/port add bridge=bridge-customer interface=ether2
+/interface/bridge/port add bridge=bridge-customer interface=ether3
+/interface/bridge/port add bridge=bridge-customer interface=ether4
+```
+
+Verify it worked:
+
+```routeros
+/interface/bridge print
+/interface/bridge/port print
+```
+
+You should see `bridge-customer` listed with three member ports.
+
+<Warning>
+Don't use the names `bridge`, `bridge-lan`, or `fyberpay-tunnel`. Those are reserved by FyberPay and won't appear in the picker.
+</Warning>
+
+</Step>
+
+<Step title="Open the device in FyberPay">
+
+Go to **Network → Gateways**, click your MikroTik, and you'll land on the device detail page.
+
+Scroll down to **Customer Services**. You'll see an "Add service" button.
+
+</Step>
+
+<Step title="Open Add Service">
+
+Click **Add service**. The form opens with four visible fields:
+
+- **Service type**: PPPoE or Hotspot
+- **Parent interface**: dropdown
+- **VLAN ID**: optional
+- **Advanced**: subnet/gateway/pool overrides (rarely needed)
+
+</Step>
+
+<Step title="Pick the bridge from the dropdown">
+
+Click the **Parent interface** dropdown. You'll see options grouped by type:
+
+```
+┌─────────────────────────────────────┐
+│  Select an interface...         ▼   │
+├─────────────────────────────────────┤
+│  Bridges                            │
+│      bridge-customer (up)           │   ← pick this
+│  Ethernet                           │
+│      ether2 (up)                    │
+│      ether3 (up)                    │
+│      ether4                         │
+│  VLAN                               │
+│      vlan100-mgmt (up)              │
+└─────────────────────────────────────┘
+```
+
+Pick `bridge-customer`. The "(up)" tag means the interface is currently active on the router.
+
+<Tip>
+If your bridge doesn't appear, check on the router: is it disabled? Run `/interface/bridge enable bridge-customer` to turn it on.
+</Tip>
+
+</Step>
+
+<Step title="Leave VLAN blank (most cases)">
+
+For a single-LAN setup, leave the VLAN field empty. The bridge IS the network; no VLAN tagging needed.
+
+You only fill in a VLAN ID when:
+- Your bridge is a tagged trunk into a downstream switch
+- You want to separate two services on the same bridge by VLAN
+
+</Step>
+
+<Step title="Click Create service">
+
+FyberPay handles the rest. Behind the scenes it creates:
+- A PPPoE server (or Hotspot server) bound to your bridge
+- An IP address on the bridge (for example `10.50.7.1/24`)
+- A pool for client addresses
+- A DHCP server (for Hotspot) or PPP profile (for PPPoE)
+
+Within seconds, the service card flips from "Pending" to "Active" and you're live.
+
+</Step>
+
+<Step title="Test it">
+
+Plug a CPE (PPPoE) or a phone (Hotspot) into any of the bridge's member ports (`ether2`, `ether3`, or `ether4`). The customer should authenticate or land on the captive portal automatically.
+
+</Step>
+</Steps>
+
+## Adding more ports later
+
+This is the magic of bridges. Say you ran out of ports and bought a downstream switch. Plug it into `ether5` and on the router run:
+
+```routeros
+/interface/bridge/port add bridge=bridge-customer interface=ether5
+```
+
+That's it. **Don't open FyberPay.** The PPPoE / Hotspot service is already bound to the bridge, so the new port immediately serves the same service. Any customer plugged into the new switch is on the same network as everyone else.
+
+## Two services, no VLANs (the "I want both PPPoE and hotspot" question)
+
+A common request: "I have one MikroTik and I want both PPPoE customers and walk-in Hotspot customers, but I don't want to use VLANs."
+
+The answer is **two bridges**.
+
+```
+                           MikroTik
+       +----------------------------------------------+
+       | ether1  +-- bridge-pppoe ---+   +-- bridge-hotspot --+
+       | (WAN)   |  ether2  ether3  |   |  ether4  ether5   |
+       |         +-------------------+   +-------------------+
+       +----------------------------------------------+
+                    |        |             |        |
+                 PPPoE     PPPoE       Hotspot   Hotspot
+                 cust 1    cust 2      walk-in   AP
+```
+
+On the router:
+
+```routeros
+/interface/bridge add name=bridge-pppoe   comment="PPPoE customers"
+/interface/bridge add name=bridge-hotspot comment="Walk-in hotspot"
+
+/interface/bridge/port add bridge=bridge-pppoe   interface=ether2
+/interface/bridge/port add bridge=bridge-pppoe   interface=ether3
+/interface/bridge/port add bridge=bridge-hotspot interface=ether4
+/interface/bridge/port add bridge=bridge-hotspot interface=ether5
+```
+
+Then in FyberPay create **two services**:
+
+| Service | Type | Parent interface | VLAN |
+|---|---|---|---|
+| Service 1 | PPPoE | `bridge-pppoe` | (blank) |
+| Service 2 | Hotspot | `bridge-hotspot` | (blank) |
+
+Each service gets its own subnet, its own pool, its own RADIUS attributes. PPPoE customers on `ether2/3` and Hotspot customers on `ether4/5` never see each other and never compete for IPs.
+
+<Note>
+**Why two bridges and not one?** RouterOS technically allows PPPoE and Hotspot to coexist on the same interface, but FyberPay's service model assigns one IP, one DHCP server, and one pool per parent interface. Two services on one bridge would compete for those resources. Two bridges keep the model clean.
+</Note>
+
+## Tracking customers across services
+
+Even though both services run on the same MikroTik, **FyberPay tracks each customer separately**. You don't need to do anything special.
+
+| What you see | PPPoE customer | Hotspot customer |
+|---|---|---|
+| Where they appear | Subscribers page | Hotspot purchases page |
+| Login identity | PPPoE username | Voucher code or hotspot login |
+| Bandwidth limit | From their subscription plan | From the hotspot bundle |
+| Session record | RADIUS accounting | RADIUS accounting + active table |
+| Disconnect | Subscriber → Suspend | Hotspot purchase → Disconnect |
+
+Each session carries a RADIUS `NAS-Port-Id` that says which service it belongs to (`pppoe-svc-...` for PPPoE, `hs-svc-...` for Hotspot). FyberPay queries each service's sessions independently. They never get mixed up.
+
+## What you can't do (and what to do instead)
+
+<AccordionGroup>
+<Accordion title="Add 'extra ports' on top of a bridge in the form">
+The form doesn't expose a "ports" field, but if you hit the API directly with `ports: ['ether5']` and a bridge as parent, you'll get a 400 with the message:
+
+> Extra ports cannot be added on top of a bridge parent. Manage port membership on the bridge in RouterOS.
+
+**Why**: bridge membership belongs on the router. FyberPay creating a second wrapper bridge around your bridge would be confusing and almost never what you actually want.
+
+**Do this instead**: add the port to the bridge in RouterOS (`/interface/bridge/port add ...`).
+</Accordion>
+
+<Accordion title="Run two services on the same bridge without a VLAN">
+You'll get a 409 Conflict:
+
+> bridge-customer is already used by service 'PPPoE on bridge-customer'. Use a VLAN tag to colocate multiple services on the same physical port.
+
+**Why**: each FyberPay service owns the IP, the pool, and the DHCP server on its parent. Two services on one parent collide.
+
+**Do this instead**:
+- Use a different bridge for each service (the "two bridges" recipe above), or
+- Add a VLAN tag to one of the services
+</Accordion>
+
+<Accordion title="Pick the management bridge (`bridge-lan` or `bridge`)">
+These bridges are reserved for FyberPay's own management traffic and the SSTP tunnel that connects your router to FyberPay. They never appear in the picker.
+
+**Why**: putting customer traffic on the management LAN would let customers reach your admin Winbox, ACS, and OLT.
+
+**Do this instead**: create a fresh bridge with a different name (like `bridge-customer`).
+</Accordion>
+
+<Accordion title="Pick a service-scoped bridge (`br-svc-*`)">
+FyberPay sometimes creates its own bridges (named `br-svc-<random>`) when you set up a multi-port Hotspot. These are tagged as FyberPay-managed and are hidden from the picker so you can't accidentally re-bind to them.
+
+**Why**: re-binding to a bridge that's already serving a service would corrupt that service.
+
+**Do this instead**: create your own bridge with a name that doesn't start with `br-svc-`.
+</Accordion>
+</AccordionGroup>
+
+## After provisioning a new device, where to go next
+
+When you finish the **Add Device** wizard for a brand-new MikroTik, FyberPay now lands you directly on the device detail page with the **Customer Services** section highlighted. You'll see a soft pulse around the section so the next step ("create your first service") is obvious.
+
+The same thing happens after a Reprovision: dismiss the modal showing the provisioning command, and the page smooth-scrolls down to Customer Services with a brief pulse. No more hunting for what to do next.
+
+## Common questions
+
+<AccordionGroup>
+<Accordion title="My bridge doesn't show up in the dropdown">
+Check, in this order:
+
+1. Is the bridge **enabled** on the router? `/interface/bridge print` should show `disabled=no`.
+2. Is the bridge name `bridge`, `bridge-lan`, or `fyberpay-tunnel`? Those are reserved.
+3. Does the bridge name start with `br-svc-`? Those are FyberPay-managed.
+4. Is a member port of the bridge in `bridge-lan`? The port might be reserved for management.
+
+If none of those, check the **System Health** card on the device page. If it says "Unreachable", FyberPay can't query the router's interfaces, so the dropdown will be empty. Check the device's RouterOS API credentials in **Edit**.
+</Accordion>
+
+<Accordion title="My service stays in 'Pending' state">
+Click **Reconcile** on the service card to retry. If it stays pending, check:
+
+- Is the bridge enabled?
+- Does any member port already have an IP address? RouterOS won't let a port be both a bridge member and have its own IP.
+- Is the router reachable? **System Health** should be green.
+
+If it still fails, the **Diagnostics** panel on the device page will show specific RouterOS errors.
+</Accordion>
+
+<Accordion title="Can I move an existing service from a single port to a bridge?">
+Yes. On the service card, click **Edit**. Change the parent interface from `ether2` to `bridge-customer`.
+
+This is a **disruptive change**: active customer sessions on the old service will be kicked. FyberPay shows a confirmation dialog with the impact estimate before proceeding.
+
+To minimise disruption: add the existing port (`ether2`) to the bridge in RouterOS first. The service stays bound to `ether2` until you swap in FyberPay. Then swap during a low-traffic window.
+</Accordion>
+
+<Accordion title="What if I rename the bridge in Winbox?">
+Bad idea. FyberPay stored the bridge name when you created the service. Renaming the bridge in Winbox breaks the service on the next reconcile, because the old name no longer exists.
+
+If you do rename it, edit the service in FyberPay to update the parent interface to the new name, then click Reconcile.
+</Accordion>
+
+<Accordion title="Do I need to use VLANs at all?">
+No. Bridges alone handle the most common ISP setups (one LAN, multiple ports). Use VLANs only if you genuinely need L2 separation (different security domains, multi-tenant building, separating PPPoE and Hotspot on a single trunk port).
+
+If your only goal is "all my ports should serve the same customers", a single bridge is the right answer.
+</Accordion>
+</AccordionGroup>
+
+## Cheat sheet
+
+```
+On the router (one-time):
+  /interface/bridge add name=bridge-customer comment="Customer LAN"
+  /interface/bridge/port add bridge=bridge-customer interface=ether2
+  /interface/bridge/port add bridge=bridge-customer interface=ether3
+  /interface/bridge/port add bridge=bridge-customer interface=ether4
+
+In FyberPay:
+  Network → Gateways → click MikroTik
+  → Customer Services → Add service
+  → Type: PPPoE (or Hotspot)
+  → Parent interface: pick "bridge-customer" under the Bridges group
+  → VLAN: blank
+  → Create
+
+Add more ports later (router only, no FyberPay action needed):
+  /interface/bridge/port add bridge=bridge-customer interface=ether5
+```
+
+That's it. Three commands on the router, three clicks in FyberPay, and any device on any bridge port gets the same service.
