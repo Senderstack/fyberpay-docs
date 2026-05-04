@@ -5,19 +5,28 @@ description: Configure RADIUS authentication, PPPoE profiles, bandwidth shaping,
 
 ## Overview
 
-FyberPay automates network provisioning so that subscriber activations, plan changes, suspensions, and cancellations are reflected on your network infrastructure in real-time. The system integrates with FreeRADIUS for authentication and MikroTik RouterOS for bandwidth enforcement and PPPoE service.
+FyberPay automates network provisioning so that subscriber activations, plan changes, suspensions, and cancellations are reflected on your network infrastructure in real-time. The system integrates with FreeRADIUS for authentication and MikroTik RouterOS for service-level configuration (PPPoE servers, hotspot servers, walled-garden rules).
+
+This guide covers the **RADIUS / subscriber** side. For the **router side** (creating PPPoE or hotspot services on a MikroTik, picking the parent interface, drift detection), see the [MikroTik integration](/integrations/mikrotik) and the [bridge-as-parent guide](/guides/mikrotik-bridge-as-parent).
 
 ## Architecture
 
 ```
-Subscriber CPE -> MikroTik (PPPoE Server) -> FreeRADIUS -> PostgreSQL
-                                                              ^
-                                                              |
-                                                FyberPay API (writes credentials,
-                                                groups, and rate-limit attributes)
+Subscriber CPE -> MikroTik (PPPoE / Hotspot Server) -> FreeRADIUS -> PostgreSQL
+        ^               ^                                 ^
+        |               |                                 |
+   created via    NasService                  FyberPay writes credentials,
+  CPE management  reconciler                  plan groups, and rate-limit
+   (TR-069)       (writes server,             attributes
+                   IP, pool, DHCP)
 ```
 
-When FyberPay activates a subscription, it writes the subscriber's credentials and plan attributes directly to the RADIUS database. The MikroTik router queries FreeRADIUS during PPPoE authentication and receives the bandwidth limits and IP assignment for that subscriber.
+Two halves to keep separate in your head:
+
+- **Router side (NasService model)**: when you create a service in **Network → Gateways → [device] → Customer Services**, FyberPay's reconciler writes the PPPoE server, hotspot server, IP address, pool, and DHCP config to the router. Each NasService binds to a parent interface (ether port, SFP, VLAN, or operator-managed bridge). See the [MikroTik integration](/integrations/mikrotik) for the full data model.
+- **RADIUS / subscriber side (this guide)**: when a subscriber activates, FyberPay writes their credentials to the RADIUS database. The MikroTik router (already configured with the service) queries FreeRADIUS during authentication and gets the bandwidth limits and IP assignment.
+
+The two halves work together: the NasService creates the *server* on the router, and the RADIUS provisioning creates the *user* in the database. A subscriber needs both to come online.
 
 ## RADIUS Setup
 

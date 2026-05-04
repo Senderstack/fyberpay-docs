@@ -11,81 +11,98 @@ Hotspot authentication flows through the same RADIUS infrastructure as PPPoE, so
 
 ## MikroTik Hotspot Server Setup
 
+The recommended path is to let FyberPay create and manage the hotspot server for you via the **NasService** model. Each hotspot service you create through the FyberPay UI is reconciled into the right combination of `/ip/hotspot`, `/ip/dhcp-server`, `/ip/pool`, and walled-garden rules on the live router.
+
 <Steps>
-  <Step title="Create a hotspot interface">
-    On your MikroTik router, go to **IP > Hotspot > Hotspot Setup** and run the wizard on your subscriber-facing interface (bridge or WLAN).
-
-    Alternatively, FyberPay can configure the hotspot server remotely. Navigate to **Network > [Router] > Setup PPPoE** and select the **Hotspot** option instead.
+  <Step title="Make sure the router is provisioned">
+    The MikroTik must be connected to FyberPay first. Follow the [MikroTik integration guide](/integrations/mikrotik) to register the device, run the bootstrap script, and confirm the SSTP tunnel is online.
   </Step>
-  <Step title="Point RADIUS to FyberPay">
-    Configure the MikroTik hotspot server to authenticate against FreeRADIUS:
 
-    ```
-    /radius
-    add address=<freeradius-ip> secret=<shared-secret> service=hotspot
-    ```
+  <Step title="Pick the parent interface">
+    In the FyberPay admin, go to **Network → Gateways**, click your MikroTik, and scroll to **Customer Services**. Click **Add service**, then:
+    - **Type**: Hotspot
+    - **Parent interface**: pick the interface customers will connect through. The dropdown groups options by type (Bridges, Ethernet, SFP, VLAN). For multi-port hotspots (a downstream switch or AP feeding multiple ether ports), pick a bridge. See the [bridge-as-parent guide](/guides/mikrotik-bridge-as-parent) for the typical setup.
+    - **VLAN ID**: leave blank unless you're trunking VLANs.
 
-    Ensure the RADIUS shared secret matches the one configured in your FreeRADIUS `clients.conf`.
+    Click **Create service**.
   </Step>
-  <Step title="Enable RADIUS authentication on the hotspot">
-    Under **IP > Hotspot > Server Profiles**, edit your hotspot profile:
-    - Set **Use RADIUS** to `yes`
-    - Set **RADIUS Accounting** to `yes`
-    - Set **RADIUS Interim Update** to a suitable interval (e.g., 5 minutes)
+
+  <Step title="What the reconciler does">
+    Behind the scenes, FyberPay creates these resources on the router (each tagged with `comment=FyberPay-svc:<service-id>`):
+    - `/ip/hotspot/profile` with the captive portal redirect target
+    - `/ip/address` on the parent interface (a `/24` from `10.50.0.0/16`)
+    - `/ip/pool` for client addresses
+    - `/ip/dhcp-server` and `/ip/dhcp-server/network` bound to the interface
+    - `/ip/hotspot` server bound to the parent interface, using FreeRADIUS for auth/acct
+    - Default walled-garden entries (FyberPay payment portal, M-Pesa endpoints)
+
+    The service appears as a card in the Customer Services panel. State flips from `pending` to `active` once the reconciler finishes.
   </Step>
-  <Step title="Configure the IP pool">
-    Create an IP pool for hotspot clients:
 
-    ```
-    /ip pool
-    add name=hotspot-pool ranges=10.10.0.2-10.10.0.254
-    ```
-
-    Assign this pool to the hotspot server profile.
+  <Step title="Verify it works">
+    Connect a phone to one of the parent interface's member ports (or an AP plugged into one of those ports). The phone should hit the captive portal automatically. Buy a voucher or enter credentials, and the phone should authenticate against FreeRADIUS and get internet at the package speed.
   </Step>
 </Steps>
+
+<Info>
+The legacy approach of running `/ip/hotspot/setup` manually on the router and pointing RADIUS at FyberPay still works, but you lose drift detection, hard-cut reconfigure, and the walled-garden auto-management. New deployments should use the NasService flow.
+</Info>
 
 <Info>
   FyberPay uses the same RADIUS database for both PPPoE and hotspot authentication. Subscribers with access method set to "hotspot" are provisioned identically in `radcheck` and `radusergroup`, but they authenticate through the captive portal instead of a PPPoE client.
 </Info>
 
-## Login Page Customization
+## Captive Portal Customization
 
-MikroTik hotspot servers serve a captive portal login page to unauthenticated clients. You can customize this page to match your brand and integrate FyberPay payment flows.
+FyberPay renders the captive portal page server-side per organization. You don't upload `login.html` to the router. Instead, you pick a theme and a few branding fields in the admin UI, FyberPay generates the HTML, and the next page load on any hotspot served by your routers picks up the new look automatically.
 
 ### Default Login Flow
 
 1. Subscriber connects to the Wi-Fi network
-2. On opening a browser, they are redirected to the hotspot login page
-3. They enter their username (phone number) and password (voucher code or account password)
-4. MikroTik authenticates via RADIUS
-5. On success, the subscriber gains internet access with the bandwidth limits from their plan
+2. On opening a browser, they are redirected to FyberPay's hosted captive portal
+3. They either:
+   - Enter a voucher code (one-tap login) **or**
+   - Buy a package directly with M-Pesa (STK Push) and the portal auto-logs them in once payment confirms
+4. RADIUS authenticates and returns bandwidth limits to MikroTik
+5. The subscriber is redirected to the configured post-login URL (or to their original destination)
 
-### Custom Login Page
+### Configuring the portal
 
-Upload a custom `login.html` to your MikroTik router at **Files > hotspot/login.html**. Key elements to include:
+Navigate to **Hotspot → Portal** in the admin. The configuration form has these fields:
 
-- Your ISP branding (logo, colors)
-- A login form with username and password fields
-- A link to purchase a voucher or create an account via the FyberPay portal
-- The FyberPay payment page URL for direct M-Pesa purchases
+| Field | What it controls | Notes |
+|---|---|---|
+| **Theme** | The overall visual design | Five built-in themes: `classic`, `modern`, `minimal`, `vibrant`, `dark`. Each ships with its own typography, layout, and motion language. Pick the one that matches your brand. |
+| **Logo URL** | The image shown above the form | HTTPS URL to a PNG or SVG. Recommended: 200×60px or smaller. |
+| **Primary colour** | The main accent (buttons, links) | Hex format `#RRGGBB`. |
+| **Accent colour** | Secondary highlights (badges, focus rings) | Hex format `#RRGGBB`. |
+| **Headline** | The big message above the form | Up to 120 characters. |
+| **Subheadline** | The smaller line below the headline | Up to 200 characters. |
+| **Post-login redirect URL** | Where users land after successful auth | Optional. If unset, MikroTik's default `$(link-orig)` is used (the page they were originally trying to reach). |
 
-<Tip>
-  Include a "Buy with M-Pesa" button on your login page that links to `https://yourorg.fyberpay.com/portal/buy`. This allows walk-in customers to purchase a package and receive credentials instantly.
-</Tip>
+There is a **live preview** panel that re-renders as you type, so you can see exactly what subscribers will see.
 
-### Login Page Variables
+<Info>
+The portal is **server-rendered on every connect**, so updates take effect on the next page load. No MikroTik push needed, no router restart, no DNS cache to wait on. Saving the form is the deploy.
+</Info>
 
-MikroTik injects variables into the login page that you can use for dynamic content:
+### Themes
 
-| Variable | Description |
+| Theme | Best for |
 |---|---|
-| `$(identity)` | Router name |
-| `$(login-by)` | Authentication method |
-| `$(error)` | Error message on failed login |
-| `$(error-orig)` | Original error message |
-| `$(ip)` | Client IP address |
-| `$(mac)` | Client MAC address |
+| `classic` | Traditional ISPs that want a professional, conservative feel |
+| `modern` | Tech-forward brands; clean grid + gradient accents |
+| `minimal` | Operators who want the portal to feel invisible (logo + form, not much else) |
+| `vibrant` | High-energy brands; bold colour usage and animation |
+| `dark` | Low-light environments (cafes, lounges) and modern aesthetic |
+
+You can switch themes anytime. Existing subscribers see the new theme on their next captive-portal hit (typically the next time they connect to Wi-Fi).
+
+### Per-router branding behaviour
+
+The hotspot service the reconciler creates on each router points to FyberPay's hosted portal URL. Every router serving your subscribers redirects to the same portal endpoint, scoped by your org subdomain. You set the branding once and it applies everywhere.
+
+If you need different branding per location (e.g. one ISP managing several venues with their own logos), each venue should be a separate FyberPay org / subdomain.
 
 ## Voucher and Package Management
 
@@ -191,58 +208,44 @@ These are set per plan in the `radgroupreply` table alongside the rate-limit att
   For time-based packages, set the `Session-Timeout` RADIUS attribute to match the package duration. A 1-hour package would have `Session-Timeout = 3600`.
 </Tip>
 
-## Walled Garden Configuration
+## Walled Garden
 
-The walled garden allows unauthenticated hotspot users to access specific websites without logging in. This is essential for:
+The walled garden allows unauthenticated hotspot users to reach specific websites without logging in. This is essential for the captive portal (so users can see it before they authenticate), for M-Pesa STK Push (the user's phone needs to reach Safaricom before they have internet), and for FyberPay's payment callbacks.
 
-- The FyberPay payment portal (so users can buy packages before authenticating)
-- M-Pesa payment endpoints (so STK Push works before the user has internet)
-- Your ISP's marketing or info page
+### What FyberPay manages automatically
 
-### Configuring Walled Garden on MikroTik
-
-<Steps>
-  <Step title="Open hotspot walled garden settings">
-    On your MikroTik router, go to **IP > Hotspot > Walled Garden**.
-  </Step>
-  <Step title="Add allowed destinations">
-    Add entries for each domain or IP that should be accessible without authentication:
-
-    ```
-    /ip hotspot walled-garden ip
-    add dst-host=yourorg.fyberpay.com action=accept
-    add dst-host=*.safaricom.co.ke action=accept
-    add dst-host=api.safaricom.co.ke action=accept
-    ```
-  </Step>
-  <Step title="Add DNS access">
-    Ensure DNS resolution works for unauthenticated clients:
-
-    ```
-    /ip hotspot walled-garden ip
-    add dst-port=53 protocol=udp action=accept
-    add dst-port=53 protocol=tcp action=accept
-    ```
-  </Step>
-  <Step title="Test access">
-    Connect a device to the hotspot without authenticating. Verify that you can reach the FyberPay portal and complete an M-Pesa payment. All other sites should redirect to the login page.
-  </Step>
-</Steps>
-
-<Warning>
-  If the walled garden is not configured correctly, subscribers in the dunning walled-garden state or new customers trying to purchase packages will not be able to reach the payment portal. Always test this after router configuration changes.
-</Warning>
-
-### Required Walled Garden Entries
-
-At minimum, your walled garden should allow access to:
+When the reconciler creates a hotspot service, it also sets up the walled-garden defaults that FyberPay's flow needs:
 
 | Destination | Reason |
 |---|---|
-| `yourorg.fyberpay.com` | Subscriber portal and payment page |
-| `api.fyberpay.com` | API for STK Push and payment processing |
-| `*.safaricom.co.ke` | M-Pesa API endpoints |
-| DNS (port 53 UDP/TCP) | Domain name resolution |
+| FyberPay's hosted portal endpoint | The captive portal itself |
+| `*.safaricom.co.ke`, `api.safaricom.co.ke` | M-Pesa Daraja API for STK Push |
+| FyberPay's payment callback URLs | So Daraja's callback can reach the platform |
+| DNS (UDP/TCP 53) | Name resolution for unauthenticated clients |
+
+You don't need to add these manually. They live in the service's walled-garden config and are reconciled on every apply.
+
+### Adding custom entries
+
+If your ISP wants to allow unauthenticated access to additional sites (your own marketing page, a partner portal, a help-desk URL), add them via the FyberPay UI on the service's card. The reconciler picks up the change on the next reconcile and pushes the entries to `/ip/hotspot/walled-garden` and `/ip/hotspot/walled-garden/ip`.
+
+<Warning>
+Avoid wildcard entries to general domains (`*.com`, `*.google.com`). Anything in the walled garden bypasses your authentication entirely.
+</Warning>
+
+### Manual walled-garden management (legacy)
+
+If you bypassed the NasService flow and configured the hotspot manually with `/ip/hotspot/setup`, you'll need to manage the walled garden yourself:
+
+```routeros
+/ip hotspot walled-garden ip
+  add dst-host=*.safaricom.co.ke action=accept
+  add dst-host=api.safaricom.co.ke action=accept
+  add dst-port=53 protocol=udp action=accept
+  add dst-port=53 protocol=tcp action=accept
+```
+
+This is supported but not recommended for new deployments.
 
 ## Hotspot with FyberPay Billing
 
