@@ -50,13 +50,32 @@ FyberPay generates invoices automatically based on each subscriber's billing cyc
 3. **Payment reconciled** when M-Pesa callback received
 4. **Dunning triggered** if payment not received within grace period
 
+## Admin UI Structure
+
+FyberPay's admin UI is organized into **hubs**, each grouping related operational surfaces under one tab:
+
+| Hub | Tabs | What lives here |
+|---|---|---|
+| **Network** | Gateways, CPE (ONTs), SmartOLT, Sessions, Map, Health | Every device on your network. NAS devices, OLT chassis, customer-premises ONTs/routers, live RADIUS sessions, geo-mapped device health. |
+| **Hotspot** | Packages, Vouchers, Portal | Captive-portal product catalogue. Time-based or data-cap packages, voucher batches, the org-themed portal designer. |
+| **Messages** | SMS, WhatsApp, Emails | Communication channels. Templates, sent history, gateway credentials per channel. |
+| **Insights** | Analytics, AI Intelligence | Subscribers, payments, churn, growth. AI-generated narrative insights about your business. |
+| **Operations** | Audit log, Outbox events, Background jobs | Engineering / NOC view: what fired when, what failed, what's queued. |
+| **Subscribers** | List, Leads | Customer-facing records. Existing subscribers and pre-conversion leads. |
+| **Billing** | Invoices, Payments, Plans | Financial surface. Open/paid/overdue invoices, M-Pesa transaction reconciliation, plan catalogue. |
+
+Settings are grouped at the bottom of the sidebar (General, Team, Billing & Dunning, Payment Gateways, Messaging, Network).
+
 ## Network Integration
 
 FyberPay connects to your network infrastructure:
 
-- **RADIUS (FreeRADIUS)**: Authentication, authorization, and accounting for PPPoE and Hotspot subscribers
-- **MikroTik RouterOS**: Direct API sync for PPP secrets, hotspot users, bandwidth profiles, and queues
-- **GenieACS (TR-069)**: CPE auto-configuration for ONTs and routers
+- **RADIUS (FreeRADIUS)**: Authentication, authorization, and accounting for PPPoE and Hotspot subscribers. See the [FreeRADIUS integration](/integrations/freeradius).
+- **MikroTik RouterOS**: API-driven PPPoE / Hotspot / CPE-management services via the **NasService model**, with reconciler-based drift detection and a reserved-set guard against management-LAN corruption. See the [MikroTik integration](/integrations/mikrotik) and the [bridge-as-parent guide](/guides/mikrotik-bridge-as-parent).
+- **GenieACS (TR-069)**: CPE auto-configuration for ONTs and routers (L3 management). See the [GenieACS integration](/integrations/genieacs).
+- **SmartOLT**: GPON OLT management (L2 / OMCI for ONUs).
+
+GenieACS and SmartOLT cover complementary layers: GenieACS handles the L3 / TR-069 path (WiFi config, firmware, customer-router parameters), SmartOLT handles L2 / OMCI on the OLT (ONU optical signal, port enable/disable, SLA enforcement). Most ISPs run both.
 
 ## Event-Driven Architecture
 

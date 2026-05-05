@@ -36,7 +36,7 @@ FyberPay connects to each router through an SSTP tunnel. The router's REST API l
 
 <Steps>
   <Step title="Register the NAS device">
-    In the FyberPay admin dashboard, navigate to **Network > NAS Devices** and add a new device. Provide:
+    In the FyberPay admin dashboard, navigate to **Network → Gateways** and click **Add Device**. The wizard runs in four steps: type → name → provision → services. Provide:
     - **Device name**: a human-readable label (e.g. "Westlands-POP-1")
     - **IP address**: the router's WAN IP (used for RADIUS NAS registration)
     - **RADIUS secret**: shared secret for RADIUS authentication
@@ -131,35 +131,83 @@ FyberPay polls the following data from each connected router:
 
 ## What FyberPay Writes to the Router
 
+FyberPay's writes to the router are driven by the **NasService model**: one row per customer-facing service (PPPoE, Hotspot, or CPE Management), reconciled against live router state by the **NasService Reconciler**. Operators create services in the FyberPay admin UI; the reconciler translates each service into the right combination of PPPoE servers, hotspot servers, IP addresses, pools, DHCP, VLAN sub-interfaces, walled-garden rules, and bridges on the live router.
+
+### The NasService model
+
+Each service is one row in the `nas_services` table with these fields:
+
+| Field | Meaning |
+|---|---|
+| `type` | `pppoe`, `hotspot`, or `cpe-management` |
+| `parentInterface` | The interface on the router the service binds to. Can be an ether port (`ether2`), an SFP port (`sfp1`), a VLAN sub-interface (`vlan100-mgmt`), or an **operator-managed bridge** (`bridge-customer`). |
+| `vlanId` | Optional VLAN tag. If set, the reconciler creates a VLAN sub-interface as the binding point. |
+| `subnet`, `gateway`, `poolStart`, `poolEnd` | Auto-allocated from `10.50.0.0/16` (customer) or `10.20.0.0/16` (management). Operator can override under "Advanced". |
+| `state` | `pending` → `active` (or `failed` / `degraded` if the reconciler hits an error or detects drift). |
+
+Each NasService has its own RouterOS resources, named with a deterministic 8-hex slug derived from the service id. For example, the PPPoE server for service `5d8f2a1e-...` is named `pppoe-svc-5d8f2a1e`. Every resource the reconciler creates carries `comment=FyberPay-svc:<service-id>` so ownership is unambiguous on the router.
+
+### The reconciler primitives
+
+Three idempotent primitives, all in `apps/api/src/network/nas-services/reconciler.ts`:
+
+- **applyService(serviceId)**: read live state for the service tag, compute a diff against the desired state, execute the diff. Used on create, update, manual reconcile, and drift recovery.
+- **removeService(serviceId)**: tear down every resource carrying the service tag. Used on delete.
+- **reconcileDevice(deviceId)**: scan the device for orphaned resources (carrying a service tag for a service that no longer exists in the database) and remove them.
+
+### Bridge as parent interface
+
+If the operator already runs a downstream switch off their MikroTik and wants every customer plugged into any LAN port to use the same service, they create a bridge on the router and pick that bridge as the parent interface. See the [bridge-as-parent guide](/guides/mikrotik-bridge-as-parent) for the full operator workflow.
+
+The parent-interface dropdown groups options by type (Bridges, Ethernet, SFP, VLAN). Bridges are filtered to exclude `bridge`, `bridge-lan`, `fyberpay-tunnel`, and any FyberPay-managed `br-svc-*` bridge (those are reserved by the reconciler itself). VLAN-on-bridge is allowed for tagged trunks.
+
+### Reserved interfaces (safety guard)
+
+Before any RouterOS write, the reconciler checks the parent interface against a **reserved set** computed live from the router. The reserved set is the union of seven sources:
+
+1. Always-reserved names: `bridge`, `bridge-lan`, `fyberpay-tunnel`
+2. Members of `bridge-lan` (the management LAN)
+3. Interfaces with a bound DHCP client (the WAN uplink)
+4. Interfaces a default route exits through
+5. Members of the RouterOS `WAN` interface-list, if the operator set one
+6. PPPoE/L2TP/SSTP **client** interfaces (the router dialing out to its upstream)
+7. FyberPay-managed service-scoped bridges (`br-svc-*`) — identified by their service-tag comment
+
+Any service create / update / reconcile that targets a reserved interface is rejected with a 400 before any router write happens. This prevents the entire class of "FyberPay accidentally bound a customer service to my management LAN" bugs.
+
+### Drift detection
+
+A BullMQ background job runs every ~15 minutes per device. For each NasService, it computes the diff between the live router state and the desired state. If the diff is non-empty, the service is marked `degraded` and an outbox event (`nas.service.drift_detected`) is emitted.
+
+Drift detection is **detect-only** by default. The operator clicks **Reconcile** on the service card to apply the diff. Auto-healing is intentionally not on by default to avoid silently undoing deliberate operator changes made in Winbox.
+
+### Reconfigure semantics (hard cut)
+
+When an operator changes a service's `type`, `parentInterface`, or `vlanId`, the reconciler tears down the old resources and creates new ones. Active customer sessions on the affected service are kicked. The UI surfaces a confirmation dialog quoting the impact ("This will disconnect N active users. Re-issue with confirm=true to proceed.") before allowing the change.
+
+Non-disruptive changes (subnet/gateway/pool tweaks, walled-garden adjustments) apply without kicking sessions.
+
+### Other writes
+
 <AccordionGroup>
-  <Accordion title="PPPoE Server Setup">
-    FyberPay can auto-detect the best interface for PPPoE (preferring bridges, then the busiest Ethernet port) and create a PPPoE server:
+  <Accordion title="Walled garden (hotspot)">
+    **Domains**: `PUT /rest/ip/hotspot/walled-garden`
+    **IPs**: `PUT /rest/ip/hotspot/walled-garden/ip`
 
-    ```json
-    {
-      "service-name": "FyberPay-PPPoE",
-      "interface": "bridge1",
-      "default-profile": "default",
-      "authentication": "pap,chap,mschap2",
-      "one-session-per-host": "yes",
-      "comment": "FyberPay PPPoE Service"
-    }
-    ```
-
-    Existing FyberPay PPPoE servers are removed before creating new ones (idempotent operation).
-  </Accordion>
-
-  <Accordion title="Simple Queue Updates">
-    **Endpoint**: `PATCH /rest/queue/simple/{id}`
-
-    Modify `max-limit`, `burst-limit`, and `target` on existing queues. Used when an ISP manages bandwidth through queues rather than RADIUS attributes.
+    Each hotspot service maintains its own walled-garden rules (Safaricom Daraja endpoints, FyberPay's payment callback domain, M-Pesa portal). Operators can add custom entries per service.
   </Accordion>
 
   <Accordion title="Firewall Address Lists">
     **Add entry**: `PUT /rest/ip/firewall/address-list`
     **Remove entry**: `DELETE /rest/ip/firewall/address-list/{id}`
 
-    Used for walled garden enforcement, IP blocking, and access control. Each entry includes the list name, IP address, and an optional comment.
+    Used for walled-garden enforcement on the L3 path (post-dunning subscribers redirected to a "pay your bill" portal until they pay).
+  </Accordion>
+
+  <Accordion title="Simple Queue Updates">
+    **Endpoint**: `PATCH /rest/queue/simple/{id}`
+
+    Optional. Used when an ISP manages bandwidth through router-side queues rather than RADIUS attributes (the recommended path is RADIUS-driven via FreeRADIUS, see the [FreeRADIUS integration](/integrations/freeradius)).
   </Accordion>
 
   <Accordion title="Device Reboot">
@@ -168,6 +216,15 @@ FyberPay polls the following data from each connected router:
     Triggers a remote reboot. Requires `admin` or `super_admin` role. All reboot actions are recorded in the audit log.
   </Accordion>
 </AccordionGroup>
+
+### What FyberPay does NOT manage on the router
+
+- **WAN configuration**: never touched. WAN is detected (sources 3/4/5/6 of the reserved set) and protected.
+- **Operator-managed bridges**: their existence and port membership are owned by the operator. FyberPay binds to bridges but never modifies their members or comments.
+- **Default firewall**: never touched. The bootstrap script only adds tunnel-traffic allow rules.
+- **Existing PPP profiles**: never touched. FyberPay creates per-service profiles named `ppp-prof-svc-<slug>`.
+
+This separation is deliberate. The operator can edit anything in Winbox without breaking FyberPay, and the drift detector will surface any divergence rather than silently overwriting the operator's intent.
 
 ## Fleet Monitoring
 
@@ -233,6 +290,35 @@ The `interim-update=5m` setting tells the router to send RADIUS accounting updat
 
   <Accordion title="Circuit breaker is open">
     FyberPay wraps all RouterOS API calls in a circuit breaker. If a router is consistently unreachable (multiple consecutive failures), the circuit breaker opens and stops sending requests for a cooldown period. The device will show as unreachable until the circuit closes and the next health check succeeds.
+  </Accordion>
+
+  <Accordion title="A service stays in 'pending' state forever">
+    The reconciler hit a RouterOS write error mid-flight. Click **Reconcile** on the service card to retry. If it stays pending, common causes:
+    - Parent interface no longer exists (renamed or deleted in Winbox)
+    - Parent interface has its own IP that conflicts with the service's allocated subnet
+    - A bridge member port has its own `/ip/address` (RouterOS won't allow it as a bridge port)
+    - The router is unreachable (circuit breaker open)
+
+    The **Diagnostics** panel on the device page shows the specific RouterOS error from the last reconcile attempt.
+  </Accordion>
+
+  <Accordion title="A service shows 'degraded' state">
+    Drift detection found a difference between the live router state and the desired state. Common causes:
+    - An operator manually deleted the PPPoE/hotspot server in Winbox
+    - The router was reset to defaults but FyberPay's NasService row still exists
+    - Someone modified a FyberPay-managed resource without going through the FyberPay UI
+
+    Click **Reconcile** on the service card to re-apply the desired state. If the operator change was intentional (they wanted the resource gone), delete the NasService in FyberPay instead.
+  </Accordion>
+
+  <Accordion title="The bridge I created in Winbox does not appear in the parent-interface picker">
+    Possible causes:
+    - The bridge is disabled. Run `/interface/bridge enable <name>` on the router.
+    - The bridge name is `bridge`, `bridge-lan`, or `fyberpay-tunnel` (always-reserved).
+    - The bridge's comment carries a FyberPay service tag (`FyberPay-svc:...`). Either you accidentally edited an existing `br-svc-*` bridge's comment, or this is a FyberPay-managed bridge. Pick a different bridge with a different name.
+    - The router is unreachable, so FyberPay cannot list its interfaces.
+
+    See the [bridge-as-parent troubleshooting](/guides/mikrotik-bridge-as-parent#common-questions) for more.
   </Accordion>
 </AccordionGroup>
 
