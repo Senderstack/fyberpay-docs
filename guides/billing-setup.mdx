@@ -1,11 +1,21 @@
 ---
 title: Billing Setup
-description: Configure invoicing, payment terms, tax settings, and billing cycles for your ISP.
+description: Configure invoicing, payment terms, tax, billing cycles, settlement destination, and platform fees.
+lastReviewed: 2026-05-14
 ---
 
 ## Overview
 
 FyberPay handles the entire billing lifecycle for your ISP: invoice generation, tax calculation, payment tracking, and receipt delivery. This guide walks you through configuring billing to match your business requirements.
+
+## Two sides of "billing"
+
+Settings → Billing covers two things that are easy to confuse:
+
+1. **How you bill your subscribers** – plans, invoice prefix, currency, tax, grace period, dunning. This is the bulk of this page.
+2. **How FyberPay bills you (and pays you)** – your platform fee, hotspot commission accrual, the 1% transaction fee on centralized paybill, and the **settlement destination** where centralized funds are disbursed each business day.
+
+Subscriber-side billing details are below. Platform-side billing has its own section: see [Platform fees and settlement](#platform-fees-and-settlement).
 
 ## Billing Settings
 
@@ -166,6 +176,34 @@ FyberPay sends automated billing notifications at several points:
 </Tip>
 
 Notification channels can be toggled independently. Navigate to **Settings > Notifications** to enable or disable SMS and email notifications.
+
+## Platform fees and settlement
+
+The lines below describe how money flows **between FyberPay and your ISP** (not between you and your subscribers).
+
+### Monthly platform fee
+
+A flat monthly fee tied to your tier (Starter / Growth / Pro / Enterprise) plus a small per-active-subscriber charge. Exact numbers live at [`/pricing`](https://fyberpay.com/pricing) and on your **My Billing** page in the admin. Charged on the same day every month, on a platform invoice that you can settle via M-Pesa or bank transfer.
+
+### Transaction fee (centralized paybill)
+
+When subscribers pay into **FyberPay's shared M-Pesa Paybill** (`4026145`), FyberPay deducts **1%** of each successful payment as a transaction fee. The fee is itemised on each disbursement and rolled into the monthly platform invoice.
+
+ISPs running their own Daraja credentials in **direct mode** pay no transaction fee here. See [M-Pesa Integration → Centralized vs Direct](/guides/mpesa-integration) for the choice between modes.
+
+### Hotspot commission
+
+A percentage of hotspot voucher revenue, **accrued per voucher purchase and billed monthly** on the platform invoice — not deducted at payment time. The rate is configured per-org; see your **My Billing** page for the current rate.
+
+### Settlement destination
+
+Centralized-mode payments collect into FyberPay's paybill, then disburse to the ISP the next business day. The destination is configured at **Settings → Billing → Settlement destination**:
+
+- **M-Pesa Paybill** – your Safaricom paybill plus an account name.
+- **M-Pesa Till (Buy Goods)** – a till number (e.g. `5332138`). No account-number suffix.
+- **Bank via Tuma** – Tuma-handled payout to a Kenyan bank account.
+
+If no destination is configured, the platform admin sees the disbursement flagged with `MissingSettlementPaybill` on the disbursements dashboard, and funds stay parked until you fix it.
 
 ## Next Steps
 

@@ -1,6 +1,7 @@
 ---
 title: "FreeRADIUS"
 description: "How FyberPay provisions RADIUS attributes, manages subscriber authentication, enforces bandwidth plans, and handles CoA/disconnect."
+lastReviewed: 2026-05-14
 ---
 
 FyberPay uses FreeRADIUS as the central authentication and authorization server for PPPoE subscribers. The RADIUS database is managed entirely by FyberPay through the transactional outbox pattern: when a subscription is activated, upgraded, suspended, or cancelled, an event triggers the corresponding RADIUS provisioning.

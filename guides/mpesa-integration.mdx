@@ -1,20 +1,58 @@
 ---
 title: M-Pesa Integration
-description: Set up Daraja API credentials, STK Push, Bill Manager, and payment reconciliation.
+description: Centralized vs direct paybill, settlement destinations, Daraja credentials, STK Push, C2B, and reconciliation.
+lastReviewed: 2026-05-14
 ---
 
 ## Overview
 
-FyberPay integrates with Safaricom's Daraja API to accept M-Pesa payments from your subscribers. There are two payment channels:
+Every FyberPay ISP collects M-Pesa payments from subscribers; the question is whether the funds land in **FyberPay's shared paybill** or in your **own Daraja shortcode**. The default and easiest path is centralized; direct is for ISPs that already operate their own Daraja account.
 
-- **STK Push (M-Pesa Express)**: FyberPay sends a payment prompt directly to the subscriber's phone. They enter their PIN and the payment is processed instantly.
-- **Bill Manager**: FyberPay pushes invoices to Safaricom's Bill Manager platform. Subscribers receive SMS invoices and can pay via the M-Pesa app or USSD.
+| Mode | Funds collected on | Daraja credentials | Transaction fee | Settlement to ISP |
+|---|---|---|---|---|
+| **Centralized** (default) | FyberPay's M-Pesa Paybill `4026145` | Not required | 1% deducted on each successful payment | Next business day to the ISP's configured settlement destination (M-Pesa Paybill, Till, or bank-via-Tuma) |
+| **Direct** | Your own Paybill or Till | Required (Consumer Key, Consumer Secret, Passkey) | None on FyberPay's side; Safaricom charges still apply | Funds reach your Safaricom account immediately, no FyberPay settlement step |
 
-Both channels can operate simultaneously. STK Push is used for on-demand payments (subscriber portal, dunning retries). Bill Manager is used for invoice-based billing.
+<Info>
+  ISPs typically start on centralized because it requires no Daraja paperwork. You can switch to direct any time by entering valid Daraja credentials at **Settings → Payment Gateways → M-Pesa**.
+</Info>
 
-## Prerequisites
+## Centralized paybill
 
-Before configuring M-Pesa in FyberPay, you need:
+Centralized mode is the default for every new ISP. Subscribers pay into FyberPay's Paybill (`4026145`) using their FyberPay account number. FyberPay reconciles each payment to the right subscriber, deducts the 1% transaction fee, and disburses the net amount to the ISP the next business day.
+
+### Subscriber payment instructions
+
+Each subscriber gets a short canonical account code (e.g. `ACM00422`) and, optionally, can pay using their phone number as the account alias. SMS and invoice notifications surface both, but the phone alias is the most reliable for typing on a phone keypad. To pay:
+
+```
+Lipa Na M-Pesa → Paybill → 4026145
+Account number: 0712345678   (subscriber's phone number)
+                or  ACM00422  (canonical short code)
+Amount: KES 2,500
+```
+
+### Settlement destination
+
+Centralized requires the ISP to declare where their daily disbursement should land. Configure at **Settings → Billing → Settlement destination**:
+
+- **M-Pesa Paybill** – Safaricom paybill number (e.g. `123456`) plus account name.
+- **M-Pesa Till (Buy Goods)** – till number (e.g. `5332138`). Single-line, no account-number suffix.
+- **Bank via Tuma** – Tuma payout to a Kenyan bank account. Tuma fees apply per disbursement; see Settings → Payment Gateways → Tuma for current rates.
+
+If no destination is configured, disbursements queue with a `MissingSettlementPaybill` error and the platform admin sees them flagged on the disbursements dashboard.
+
+### Transaction fee
+
+FyberPay deducts **1%** of each successful centralized payment. The fee is shown as a separate line on each disbursement and on the monthly platform invoice. ISPs running their own Daraja credentials in direct mode pay no transaction fee here.
+
+## Direct mode
+
+Direct mode is for ISPs that want subscribers to pay into their own Paybill or Till. You provide Daraja credentials; FyberPay drives STK Push, Bill Manager, and C2B reconciliation against your shortcode.
+
+### Prerequisites
+
+Before configuring direct mode in FyberPay, you need:
 
 1. A **Safaricom Daraja developer account** at [developer.safaricom.co.ke](https://developer.safaricom.co.ke)
 2. A registered **Paybill** or **Till** number
