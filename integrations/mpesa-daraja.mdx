@@ -1,7 +1,12 @@
 ---
 title: "M-Pesa Daraja API"
 description: "Integrate Safaricom M-Pesa payments via STK Push, C2B paybill, and Bill Manager for automated ISP subscriber billing."
+lastReviewed: 2026-05-14
 ---
+
+<Info>
+This page is the **direct-mode** reference: it documents the Daraja API contract for ISPs that bring their own Paybill or Till. Most ISPs operate on **centralized mode** instead, where FyberPay's shared Paybill (`4026145`) collects on their behalf and no Daraja credentials are needed. See [M-Pesa Integration → Centralized vs Direct](/guides/mpesa-integration) for which mode applies to you.
+</Info>
 
 FyberPay integrates with Safaricom's Daraja API to process M-Pesa payments for ISP subscriber billing. The platform supports three payment flows: **STK Push** (Lipa Na M-Pesa Online) for instant payment prompts, **C2B** (Customer to Business) for paybill payments, and **Bill Manager** for automated invoice delivery and recurring billing.
 

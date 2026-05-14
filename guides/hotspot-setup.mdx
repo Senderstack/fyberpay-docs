@@ -1,6 +1,7 @@
 ---
 title: Hotspot Setup
 description: Configure captive portal hotspots with login pages, vouchers, and bandwidth packages.
+lastReviewed: 2026-05-14
 ---
 
 ## Overview
@@ -261,7 +262,9 @@ The full hotspot billing flow ties together the captive portal, RADIUS, and M-Pe
 8. **Customer gets internet** at the package speed for the package duration
 
 <Info>
-  FyberPay charges a **2% commission** on hotspot transactions. This is calculated on the payment amount and deducted from your settlement. Commission details are visible at **Billing > Platform Fees**.
+  FyberPay charges a hotspot commission as a percentage of voucher revenue. The exact rate is configured per-org and visible at **Settings → Billing** under "Hotspot commission rate".
+
+  **Important**: commission is **accrued per voucher purchase and billed on the monthly platform invoice** — it is **not** deducted at payment time. Subscribers see the full voucher amount go through; settlement to your ISP also reflects the full amount minus the centralized 1% transaction fee if applicable. The hotspot commission shows up as a separate line on your monthly platform bill alongside the per-subscriber platform fee.
 </Info>
 
 ## Next Steps

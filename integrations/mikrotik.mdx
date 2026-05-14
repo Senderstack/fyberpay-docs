@@ -1,6 +1,7 @@
 ---
 title: "MikroTik RouterOS"
 description: "Connect MikroTik routers to FyberPay for real-time monitoring, PPPoE management, queue control, and automated provisioning."
+lastReviewed: 2026-05-14
 ---
 
 FyberPay communicates with MikroTik routers via the **RouterOS REST API**, introduced in RouterOS 7.1. For RouterOS 6.x devices, FyberPay uses the legacy API port. Each router connects over an encrypted SSTP management tunnel, so the API is never exposed to the public internet.
@@ -44,15 +45,19 @@ FyberPay connects to each router through an SSTP tunnel. The router's REST API l
   </Step>
 
   <Step title="Run the bootstrap script">
-    FyberPay generates a RouterOS provisioning script for each device. Copy and paste it into the router's terminal. The script handles:
+    FyberPay generates a RouterOS provisioning script for each device. Copy and paste it into the router's terminal. The script (`BOOTSTRAP_VERSION=2`, current) is **tunnel-first**: it brings the SSTP management tunnel up before touching anything else, so a partial bootstrap leaves the router reachable for retry. Steps:
     1. SSTP tunnel creation with a dedicated PPP profile (`fyberpay-tunnel`)
     2. RADIUS client configuration (authentication port 1812, accounting port 1813)
     3. REST API user creation with scoped permissions
-    4. Firewall rules to allow tunnel traffic
+    4. Firewall rules to allow tunnel traffic, ordered so the tunnel rule lands first
 
     <Warning>
     The SSTP client **must** use the dedicated `fyberpay-tunnel` PPP profile. Using `profile=default` causes IPCP negotiation failures because the default profile may have hardcoded addresses that conflict with the tunnel's dynamic IP assignment.
     </Warning>
+
+    <Info>
+    Once a device is bootstrapped, FyberPay's **firewall reconciler** keeps the FyberPay-managed firewall rules in lockstep with the platform's view: drift (a rule deleted on the router, or one shifted out of order) is reported on the device's detail page and can be fixed with one click. The reconciler only touches rules it owns (tagged `comment=FyberPay-fw:*`); the operator's hand-rolled firewall is never modified.
+    </Info>
   </Step>
 
   <Step title="Configure the REST API user">

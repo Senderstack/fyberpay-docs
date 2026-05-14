@@ -1,7 +1,12 @@
 ---
 title: "GenieACS (TR-069)"
 description: "Auto-provision and manage subscriber CPE devices using GenieACS for remote WiFi config, firmware updates, and diagnostics."
+lastReviewed: 2026-05-14
 ---
+
+<Info>
+GenieACS handles **L3/TR-069** management of routers and ONUs (WiFi config, firmware updates, diagnostics). For **L2/OMCI** management of GPON OLTs and ONU port mapping, FyberPay integrates with **SmartOLT** in parallel. The two systems are orchestrated together so a one-click ONU setup writes the right configuration through both channels.
+</Info>
 
 FyberPay integrates with [GenieACS](https://genieacs.com), an open-source TR-069 (CWMP) auto-configuration server, to remotely manage subscriber CPE devices. This enables ISPs to provision ONTs, routers, and access points without truck rolls.
 
